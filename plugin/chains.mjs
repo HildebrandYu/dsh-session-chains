@@ -17,8 +17,8 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 
-/** 日誌檔名（版本號不寫死，DSH 升 v5 也要讀得到）。 */
-export const SESSION_LOG_PATTERN = /^session\.v\d+\.jsonl\.zstd$/u;
+/** 日誌檔名（版本號不寫死，DSH 升 v5 也要讀得到）；版本號留捕獲組給下面排序用。 */
+export const SESSION_LOG_PATTERN = /^session\.v(\d+)\.jsonl\.zstd$/u;
 
 /** Zstandard frame 的魔數（little-endian 讀出的 `0xFD2FB528`）。 */
 const ZSTD_MAGIC = 0xfd2fb528;
@@ -334,12 +334,16 @@ export function readSessions(sessionsRoot, options = {}) {
 			let logs;
 			try {
 				if (!statSync(dirPath).isDirectory()) continue;
-				logs = readdirSync(dirPath).filter((name) => SESSION_LOG_PATTERN.test(name)).sort();
+				// 取版本號最大的那一份：字典序會把 `v10` 排在 `v4` 前面，格式升級後就會一直讀舊檔。
+				logs = readdirSync(dirPath)
+					.map((name) => ({ name, version: Number(SESSION_LOG_PATTERN.exec(name)?.[1]) }))
+					.filter((log) => Number.isFinite(log.version))
+					.sort((left, right) => right.version - left.version);
 			} catch {
 				continue;
 			}
 			if (logs.length === 0) continue;
-			const file = join(dirPath, logs[0]);
+			const file = join(dirPath, logs[0].name);
 			let stat;
 			try {
 				stat = statSync(file);

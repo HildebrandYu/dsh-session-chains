@@ -9,9 +9,9 @@
  *
  * 用法：node --test scripts/rename.test.mjs
  */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -667,4 +667,56 @@ test("接續提示詞路由：GET 讀檔、POST clear 刪檔；沒有檔案回 n
 	);
 	assert.equal(cleared.statusCode, 200);
 	assert.equal(existsSync(file), false, "用完就刪，不會重複貼舊的");
+});
+
+// ── 2026-10-19 ponytail 稽核補的釘子 ─────────────────────────────────────
+
+test("store 壞檔：先備份再回空表（下一次寫入不會永久覆蓋）", () => {
+	const work = mkdtempSync(join(tmpdir(), "store-corrupt-"));
+	const file = join(work, ".state", "aliases.json");
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, "{ 這不是 JSON", "utf8");
+
+	const store = loadStore(file);
+	assert.deepEqual(store.aliases, {}, "壞檔等同空表");
+	assert.equal(existsSync(file), false, "壞檔已被移走，不會被下一次寫入覆蓋");
+
+	const backups = readdirSync(dirname(file)).filter((name) => name.startsWith("aliases.json.corrupt-"));
+	assert.equal(backups.length, 1, "留了一份備份");
+	assert.equal(readFileSync(join(dirname(file), backups[0]), "utf8"), "{ 這不是 JSON");
+});
+
+test("POST titles：超過 8 KB 的回報不會被 body 上限擋掉（150 筆）", async () => {
+	const paths = fixtureLoose();
+	const applied = Array.from({ length: 150 }, (_, index) => ({
+		sessionId: `session-bulk-${index}`,
+		from: `原本的標題第 ${index} 場`,
+		to: `dsh-bulk-${String(index + 1).padStart(3, "0")}`,
+	}));
+	const payload = JSON.stringify({ applied });
+	assert.ok(payload.length > 8192, `這個 payload 要真的超過 8 KB（實際 ${payload.length}）`);
+
+	const res = await postTitles(paths, { applied });
+	assert.equal(res.statusCode, 200);
+	assert.equal(Object.keys(loadStore(paths.aliasesFile).titles).length, 150);
+});
+
+test("POST pin：名字含空白 → 400，不可安靜釘到不存在的鏈", async () => {
+	const paths = fixtureLoose();
+	const handler = createFlagHandler({ kind: "pinned" })({
+		sessionsRoot: paths.sessionsRoot,
+		workspaceSlug: paths.workspaceSlug,
+		...paths,
+	});
+	const res = fakeRes();
+	await handler(
+		fakeReq({
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ chain: "交接 鏈", on: true }),
+		}),
+		res,
+	);
+	assert.equal(res.statusCode, 400);
+	assert.deepEqual(loadStore(paths.aliasesFile).pinned, [], "壞名字不可以寫進 pinned");
 });

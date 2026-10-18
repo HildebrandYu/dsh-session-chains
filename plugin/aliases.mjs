@@ -169,7 +169,17 @@ export function loadStore(file) {
 			pinned: cleanList(parsed?.pinned),
 			archived: cleanList(parsed?.archived),
 		};
-	} catch {
+	} catch (error) {
+		// 內容壞掉（JSON 解析失敗）才留底：每個寫入路徑都是「讀整份 → 改 → 寫整份」，
+		// 不備份的話，下一次按置頂／改名就會把壞檔覆蓋成空表，資料永久消失。
+		// 權限錯誤或路徑是目錄時不動它 —— 那不是內容壞掉，改名只會讓情況更怪。
+		if (error instanceof SyntaxError) {
+			try {
+				renameSync(file, `${file}.corrupt-${Date.now()}`);
+			} catch {
+				/* 備份失敗（權限、磁碟）不該擋住讀取 */
+			}
+		}
 		return { aliases: {}, sessionChains: {}, titles: {}, pinned: [], archived: [] };
 	}
 }

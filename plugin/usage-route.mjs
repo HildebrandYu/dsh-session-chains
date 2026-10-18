@@ -98,7 +98,15 @@ export async function fetchBalance(ctx, client = defaultClientMetadata()) {
 			return { status: "unavailable" };
 		}
 		const detail = await account.getBalance(client);
-		if (detail === null || detail === undefined || detail.status !== "ready" || !Array.isArray(detail.value)) {
+		// 空錢包清單＝平台沒給資料，不是「0 元」。當成 ready 會讓 HUD 顯示 0 餘額，
+		// 而這條路由的契約是「絕不給出誤導數字」。
+		if (
+			detail === null ||
+			detail === undefined ||
+			detail.status !== "ready" ||
+			!Array.isArray(detail.value) ||
+			detail.value.length === 0
+		) {
 			return { status: "unavailable" };
 		}
 		const pick = (wallet) => ({ currency: wallet?.currency, balance: wallet?.balance });

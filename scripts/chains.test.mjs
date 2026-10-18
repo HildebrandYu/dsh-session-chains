@@ -230,3 +230,19 @@ test("groupByChain：鏈的 lastAt＝組內最後活動時間，排序也照它"
 	assert.equal(y.lastAt, 500);
 	assert.equal(groups[0].chain, "x", "最後活動較新的鏈排前面");
 });
+
+// ── 2026-10-19：同一場有多個格式版本時，要讀版本號最大的 ────────────────
+
+test("同一場有 v4 與 v10 兩份日誌 → 讀 v10（字典序會把 v10 排在 v4 前面）", () => {
+	const root = mkdtempSync(join(tmpdir(), "chains-version-"));
+	const slug = "--tmp-workspace--";
+	const dir = join(root, slug, "session-two-versions");
+	mkdirSync(dir, { recursive: true });
+	const encode = (events) => zstdCompressSync(Buffer.from(`${events.map((e) => JSON.stringify(e)).join("\n")}\n`, "utf8"));
+	writeFileSync(join(dir, "session.v4.jsonl.zstd"), encode([userEvent("舊的那句話", 1_000)]));
+	writeFileSync(join(dir, "session.v10.jsonl.zstd"), encode([userEvent("新的那句話", 2_000)]));
+
+	const { sessions } = readSessions(root, { workspaceSlug: slug });
+	assert.equal(sessions.length, 1);
+	assert.equal(sessions[0].firstLine, "新的那句話");
+});

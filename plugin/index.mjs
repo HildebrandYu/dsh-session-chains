@@ -173,7 +173,7 @@ async function readJsonBody(req, limit = 8192) {
  * @param res - 要回應的物件
  * @returns `{ok: true, value}` 或 `{ok: false}`
  */
-async function readJsonPost(req, res) {
+async function readJsonPost(req, res, limit = 8192) {
 	const method = String(req?.method ?? "GET").toUpperCase();
 	if (method === "OPTIONS") {
 		try {
@@ -197,7 +197,7 @@ async function readJsonPost(req, res) {
 		sendJson(res, 415, { ok: false, error: "content-type must be application/json" });
 		return { ok: false };
 	}
-	const body = await readJsonBody(req);
+	const body = await readJsonBody(req, limit);
 	if (!body.ok) {
 		sendJson(res, 400, { ok: false, error: body.error });
 		return { ok: false };
@@ -366,7 +366,6 @@ function writeRegistry(registryFile, store, chains) {
 }
 
 /**
-/**
  * 造出改名路由 handler（寫入路徑之一）。
  *
  * 只做一件事：把 `from → to` 登錄進對照表，並重寫 `鏈代號.md`。
@@ -491,10 +490,12 @@ export function createFlagHandler({ kind }) {
 			try {
 				const body = await readJsonPost(req, res);
 				if (!body.ok) return;
-				const raw = typeof body.value?.chain === "string" ? body.value.chain.trim() : "";
+				// 過 normalizeName：打錯字（含空白、`=`）要在這裡擋掉，
+				// 否則會安靜地釘到一條不存在的鏈，畫面看起來成功、實際沒生效。
+				const raw = normalizeName(body.value?.chain);
 				const on = body.value?.on === true;
-				if (raw === "" || raw.length > 60) {
-					sendJson(res, 400, { ok: false, error: "需要 chain（1–60 字）" });
+				if (raw === null) {
+					sendJson(res, 400, { ok: false, error: "需要 chain（1–60 字、不含空白與 =）" });
 					return;
 				}
 				const current = loadStore(aliasesFile);
@@ -545,7 +546,8 @@ export function createTitlesHandler({
 	return async (req, res) => {
 		applyCors(req, res);
 		try {
-			const body = await readJsonPost(req, res);
+			// 一次回報最多 500 筆，每筆約 120 bytes → 8 KB 的通用上限只夠 ~68 筆。
+			const body = await readJsonPost(req, res, 64 * 1024);
 			if (!body.ok) return;
 			const applied = body.value?.applied;
 			if (!Array.isArray(applied) || applied.length > 500) {
@@ -599,12 +601,16 @@ export function createTitlesHandler({
 export function apply(ctx, config) {
 	const resolved = Config["~standard"].validate(config).value;
 	try {
+		// 一份 cache 給所有 handler：冷掃 109 場是 1.5 秒的同步工作，各 handler
+		// 各持一份就會把同一份重掃五次（每次重啟後的第一次寫入都卡住事件迴圈）。
+		const sessionCache = new Map();
 		const shared = {
 			sessionsRoot: resolved.sessionsRoot !== "" ? resolved.sessionsRoot : defaultSessionsRoot(),
 			workspaceSlug: resolved.workspaceSlug,
 			aliasesFile: DEFAULT_ALIASES_FILE,
 			registryFile: DEFAULT_REGISTRY_FILE,
 			maxAuto: resolved.maxAuto,
+			cache: sessionCache,
 		};
 		const handler = createHandler(shared);
 		// 用量／餘額路由（原 dsh-token-hud）：與交接鏈同一個外掛、同一組設定。

@@ -72,7 +72,7 @@ const block = [
 	`${BEGIN}（常駐 token／餘額 HUD；移除：node scripts/install.mjs --remove --apply）`,
 	// 這一行讓每次 --apply 都產生不同內容：補丁內容相同時 DSH 不會重新組合。
 	`# 掛載時間：${new Date().toISOString()}`,
-	"# 瀏覽器半（client.js）沿著這個 entry 往上找 plugin/package.json 的 dsh.client，",
+	"# 瀏覽器半（client.js）沿著這個 entry 往上找根目錄 package.json 的 dsh.client，",
 	"# 所以 name 必須指向 plugin/index.mjs，不是專案根目錄。",
 	"# scope: all ＝ 所有工作區（建議）。改成 workspace 時**必須**一併設 workspaceSlug，",
 	"# 否則宿主只知道自己的 cwd（App 的 cwd 是 profile 目錄）→ 會算不出東西。",

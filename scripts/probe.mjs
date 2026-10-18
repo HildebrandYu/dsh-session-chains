@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 const clientPath = join(root, "plugin", "client.js");
-const pkg = JSON.parse((await import("node:fs")).readFileSync(join(root, "plugin", "package.json"), "utf8"));
+const pkg = JSON.parse((await import("node:fs")).readFileSync(join(root, "package.json"), "utf8"));
 const id = pkg.name;
 
 const base = (process.env.DSH_WEB_URL ?? "http://127.0.0.1:19387").replace(/\/$/, "");

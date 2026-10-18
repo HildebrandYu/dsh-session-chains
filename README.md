@@ -30,7 +30,18 @@
 
 ## 安裝
 
-需要 DSH（桌面版或 web 版都可以），外掛走 host 的 home 層補丁，所以**不必重啟 DSH**。
+需要 DSH（桌面版或 web 版都可以）。兩種裝法，選一種：
+
+**A. 從插件市場／`dsh plugin add`（repo 根目錄就是套件根）**
+
+```bash
+# 發佈到 npm 之後：
+dsh plugin --profile web add session-chains
+# 或直接從 GitHub：
+dsh plugin --profile web add github:HildebrandYu/dsh-session-chains
+```
+
+**B. 直接掛本機資料夾（開發用，改檔即重載）**
 
 ```bash
 git clone <this-repo> dsh-session-chains
@@ -42,6 +53,11 @@ node scripts/install.mjs --remove --apply   # 整包移除
 ```
 
 掛好後**重新整理 GUI 一次**就會出現卡片。移除時它會把自己那兩段（插件列＋HMR 監看）一起清掉。
+
+> **套件結構**：`package.json` 在 repo 根（市集與 `dsh plugin add` 只讀這個），裡面宣告
+> `dsh.bundle.patch = ./cordis.patch.yml`（沒有這個就無法安裝，只宣告 `dsh.client` 不算）
+> 與 `dsh.client.platform = web`；程式本體在 `plugin/`，`exports` 指過去。
+> 本機用 file:// 直掛時，載入器會從 `plugin/index.mjs` 往上找到根目錄的 `package.json`。
 
 > `install.mjs` 會寫兩段：`session-chains`（插件本體）與 `session-chains-hmr`（把 `plugin/` 加進 HMR 的監看根目錄，
 > 沒有這段改 `index.mjs` 不會生效）。兩段都用哨兵包住，可重複執行。

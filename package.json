@@ -3,34 +3,32 @@
   "version": "0.1.0",
   "description": "DSH 交接鏈面板：把互相交接的對話依「鏈」聚在一起、編號、一鍵切換，並在上下文到門檻時提醒或自動交接。",
   "type": "module",
-  "main": "index.mjs",
+  "main": "./plugin/index.mjs",
   "exports": {
     ".": {
-      "default": "./index.mjs"
+      "default": "./plugin/index.mjs"
     },
     "./client": {
-      "default": "./client.js"
+      "default": "./plugin/client.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }
   },
   "files": [
-    "index.mjs",
-    "chains.mjs",
-    "aliases.mjs",
-    "numbering.mjs",
-    "suggest.mjs",
-    "usage-aggregate.mjs",
-    "usage-route.mjs",
-    "client.js",
-    "package.json"
+    "plugin",
+    "cordis.patch.yml"
   ],
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "deepseek-harness",
     "plugin",
     "session",

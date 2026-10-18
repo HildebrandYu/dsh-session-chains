@@ -1,0 +1,6 @@
+# dsh bundle patch：把本插件插入 profile 的層疊。
+# 欄位語意同 dshmarket 等已上架外掛：id 是載入器用的識別，name 是套件名（安裝後由 node_modules 解析）。
+# 這一列只在「從 npm／GitHub 安裝」時作用；本機以 file:// 直掛時走的是 ~/.dsh/cordis.patch.yml 那一列。
+- insert:
+    - id: session-chains
+      name: 'session-chains'

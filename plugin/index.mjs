@@ -13,7 +13,7 @@ import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyAliases, applyAssignments, canonicalOf, loadStore, normalizeName, renderRegistry, saveStore, updateAliases } from "./aliases.mjs";
+import { applyAliases, applyAssignments, canonicalOf, loadStore, normalizeName, renderRegistry, saveStore, toggleInList, updateAliases } from "./aliases.mjs";
 import { groupByChain, readSessions } from "./chains.mjs";
 import { planTitleSync } from "./numbering.mjs";
 import { suggestChains } from "./suggest.mjs";
@@ -29,6 +29,12 @@ export const RENAME_PATH = "/local/session-chains.rename";
 
 /** 歸鏈路由（POST；把一場對話手動指定到某條鏈 —— 給「從來沒用過交接指令」的舊對話）。 */
 export const ASSIGN_PATH = "/local/session-chains.assign";
+
+/** 置頂（`{chain, on}`；寫進 store 的 `pinned`）。 */
+export const PIN_PATH = "/local/session-chains.pin";
+
+/** 封存（`{chain, on}`；寫進 store 的 `archived`）。只在面板的封存庫裡看得到。 */
+export const ARCHIVE_PATH = "/local/session-chains.archive";
 
 /** 標題回報路由（POST；瀏覽器套用完編號後回報，宿主記原標題備份）。 */
 export const TITLES_PATH = "/local/session-chains.titles";
@@ -340,6 +346,9 @@ function buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto = 10 
 		aliases: store.aliases,
 		sessionChains: store.sessionChains,
 		titles: store.titles,
+		// 置頂／封存都用「canonical 名」回傳：使用者改過名之後，舊名字的置頂仍然生效。
+		pinned: (Array.isArray(store.pinned) ? store.pinned : []).map((name) => canonicalOf(name, store.aliases)),
+		archived: (Array.isArray(store.archived) ? store.archived : []).map((name) => canonicalOf(name, store.aliases)),
 		sessions: mapped,
 		chains,
 		suggestions: suggestFor(chains),
@@ -393,6 +402,8 @@ export function createRenameHandler({
 				aliases: updateAliases(current.aliases, from, to),
 				sessionChains: current.sessionChains,
 				titles: current.titles,
+				pinned: current.pinned,
+				archived: current.archived,
 			};
 			const saved = saveStore(aliasesFile, store);
 			if (!saved.ok) {
@@ -447,7 +458,7 @@ export function createAssignHandler({
 			const sessionChains = { ...current.sessionChains };
 			if (clear) delete sessionChains[sessionId];
 			else sessionChains[sessionId] = chain;
-			const store = { aliases: current.aliases, sessionChains, titles: current.titles };
+			const store = { aliases: current.aliases, sessionChains, titles: current.titles, pinned: current.pinned, archived: current.archived };
 			const saved = saveStore(aliasesFile, store);
 			if (!saved.ok) {
 				sendJson(res, 500, { ok: false, error: saved.error });
@@ -459,6 +470,55 @@ export function createAssignHandler({
 		} catch (error) {
 			sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
 		}
+	};
+}
+
+/**
+ * 造出「置頂／封存」路由 handler（寫入路徑之四）。
+ *
+ * 兩個動作只是同一份 store 裡的兩個字串清單（`pinned`／`archived`），所以共用一支：
+ * 差別只在寫哪一個欄位。名字一律先過對照表（`canonicalOf`）——使用者可能打的是舊代號，
+ * 直接存舊名會變成「改名後置頂就掉了」。
+ *
+ * 封存**不動任何 session log**，只是不在側欄卡片顯示；面板的封存庫仍列得出來、也還原得回去。
+ * @param {{kind: "pinned"|"archived"}} options - 要寫哪一個清單
+ * @returns {(options: object) => (req, res) => Promise<void>} handler 工廠
+ */
+export function createFlagHandler({ kind }) {
+	return function build({ sessionsRoot, workspaceSlug = "", cache = new Map(), aliasesFile = DEFAULT_ALIASES_FILE, registryFile = DEFAULT_REGISTRY_FILE, maxAuto = 10 }) {
+		return async (req, res) => {
+			applyCors(req, res);
+			try {
+				const body = await readJsonPost(req, res);
+				if (!body.ok) return;
+				const raw = typeof body.value?.chain === "string" ? body.value.chain.trim() : "";
+				const on = body.value?.on === true;
+				if (raw === "" || raw.length > 60) {
+					sendJson(res, 400, { ok: false, error: "需要 chain（1–60 字）" });
+					return;
+				}
+				const current = loadStore(aliasesFile);
+				// 先過對照表：用舊代號按的置頂，也要落在改名後的那條鏈上。
+				const chain = canonicalOf(raw, current.aliases);
+				const store = {
+					aliases: current.aliases,
+					sessionChains: current.sessionChains,
+					titles: current.titles,
+					pinned: kind === "pinned" ? toggleInList(current.pinned, chain, on) : current.pinned,
+					archived: kind === "archived" ? toggleInList(current.archived, chain, on) : current.archived,
+				};
+				const saved = saveStore(aliasesFile, store);
+				if (!saved.ok) {
+					sendJson(res, 500, { ok: false, error: saved.error });
+					return;
+				}
+				const payload = buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto });
+				writeRegistry(registryFile, store, payload.chains);
+				sendJson(res, 200, payload);
+			} catch (error) {
+				sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+			}
+		};
 	};
 }
 
@@ -513,7 +573,7 @@ export function createTitlesHandler({
 				}
 				if (titles[sessionId] === undefined && from !== "") titles[sessionId] = from;
 			}
-			const store = { aliases: current.aliases, sessionChains: current.sessionChains, titles };
+			const store = { aliases: current.aliases, sessionChains: current.sessionChains, titles, pinned: current.pinned, archived: current.archived };
 			const saved = saveStore(aliasesFile, store);
 			if (!saved.ok) {
 				sendJson(res, 500, { ok: false, error: saved.error });
@@ -558,6 +618,8 @@ export function apply(ctx, config) {
 		const renameHandler = createRenameHandler(shared);
 		const assignHandler = createAssignHandler(shared);
 		const titlesHandler = createTitlesHandler(shared);
+		const pinHandler = createFlagHandler({ kind: "pinned" })(shared);
+		const archiveHandler = createFlagHandler({ kind: "archived" })(shared);
 		const nextPromptHandler = createNextPromptHandler();
 		return ctx.inject(["webServer"], (webCtx) => {
 			try {
@@ -576,6 +638,14 @@ export function apply(ctx, config) {
 				webCtx.effect(
 					() => webCtx.webServer.register({ kind: "exact", path: TITLES_PATH, handler: titlesHandler }),
 					"session-chains: 標題回報路由",
+				);
+				webCtx.effect(
+					() => webCtx.webServer.register({ kind: "exact", path: PIN_PATH, handler: pinHandler }),
+					"session-chains: 置頂路由",
+				);
+				webCtx.effect(
+					() => webCtx.webServer.register({ kind: "exact", path: ARCHIVE_PATH, handler: archiveHandler }),
+					"session-chains: 封存路由",
 				);
 				webCtx.effect(
 					() => webCtx.webServer.register({ kind: "exact", path: USAGE_PATH, handler: usageHandler }),

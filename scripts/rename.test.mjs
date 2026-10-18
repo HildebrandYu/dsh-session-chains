@@ -17,8 +17,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { extractChain, extractOutChain, groupByChain } from "../plugin/chains.mjs";
-import { applyAliases, applyAssignments, canonicalOf, loadStore, normalizeName, renderRegistry, saveStore, updateAliases } from "../plugin/aliases.mjs";
-import { createAssignHandler, createHandler, createNextPromptHandler, createRenameHandler, createTitlesHandler } from "../plugin/index.mjs";
+import { applyAliases, applyAssignments, canonicalOf, loadStore, normalizeName, renderRegistry, saveStore, toggleInList, updateAliases } from "../plugin/aliases.mjs";
+import { createAssignHandler, createFlagHandler, createHandler, createNextPromptHandler, createRenameHandler, createTitlesHandler } from "../plugin/index.mjs";
 
 /** 造一則使用者訊息事件。 */
 function userEvent(text, time = 0) {
@@ -373,9 +373,75 @@ test("對照表檔案同時保存三張表（改名／歸鏈／原標題備份�
 		aliases: updateAliases({}, "40-MediaProduction", "模擬聲音工程"),
 		sessionChains: { s1: "模擬聲音工程" },
 		titles: { s1: "原本的標題" },
+		pinned: ["模擬聲音工程"],
+		archived: [],
 	};
 	assert.equal(saveStore(paths.aliasesFile, store).ok, true);
 	assert.deepEqual(loadStore(paths.aliasesFile), store);
+});
+
+
+// ── 2026-10-19：置頂／封存（寫入路徑之四）──────────────────────────────
+
+/** 呼叫置頂／封存路由。 */
+async function flag(paths, kind, chain, on) {
+	const handler = createFlagHandler({ kind })({ sessionsRoot: paths.sessionsRoot, workspaceSlug: paths.workspaceSlug, ...paths });
+	const res = fakeRes();
+	await handler(
+		fakeReq({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chain, on }) }),
+		res,
+	);
+	return { status: res.statusCode, payload: JSON.parse(res.body || "{}") };
+}
+
+test("POST pin：置頂寫進 store，payload 帶 pinned；取消後清掉", async () => {
+	const paths = fixtureLoose();
+	await assign(paths, "session-loose-a", "dsh-demo");
+
+	const first = await flag(paths, "pinned", "dsh-demo", true);
+	assert.equal(first.status, 200);
+	assert.deepEqual(first.payload.pinned, ["dsh-demo"]);
+	assert.deepEqual(loadStore(paths.aliasesFile).pinned, ["dsh-demo"]);
+
+	const off = await flag(paths, "pinned", "dsh-demo", false);
+	assert.deepEqual(off.payload.pinned, []);
+	assert.deepEqual(loadStore(paths.aliasesFile).pinned, []);
+});
+
+test("POST archive：封存只寫 store，不動任何 session 資料；還原後清單變空", async () => {
+	const paths = fixtureLoose();
+	await assign(paths, "session-loose-a", "dsh-demo");
+
+	const on = await flag(paths, "archived", "dsh-demo", true);
+	assert.equal(on.status, 200);
+	assert.deepEqual(on.payload.archived, ["dsh-demo"]);
+	// 封存不是刪除：那一場還在 payload 的 sessions 裡
+	assert.ok(on.payload.sessions.some((session) => session.id === "session-loose-a"));
+	// 兩張清單互不干擾
+	assert.deepEqual(on.payload.pinned, []);
+
+	const off = await flag(paths, "archived", "dsh-demo", false);
+	assert.deepEqual(off.payload.archived, []);
+});
+
+test("置頂／封存用舊代號按也生效（先過對照表）", async () => {
+	const paths = fixtureLoose();
+	await assign(paths, "session-loose-a", "40-MediaProduction");
+	await rename(paths, "40-MediaProduction", "模擬聲音工程");
+
+	const res = await flag(paths, "pinned", "40-MediaProduction", true);
+	assert.equal(res.status, 200);
+	// 舊代號要落成改名後的現用名稱，否則是幽靈置頂
+	assert.deepEqual(res.payload.pinned, ["模擬聲音工程"]);
+});
+
+test("空名字或超長名字 → 400，不會寫壞 store", async () => {
+	const paths = fixtureLoose();
+	const empty = await flag(paths, "pinned", "", true);
+	assert.equal(empty.status, 400);
+	const long = await flag(paths, "archived", "x".repeat(61), true);
+	assert.equal(long.status, 400);
+	assert.deepEqual(loadStore(paths.aliasesFile).pinned, []);
 });
 
 // ── Task 3（2026-10-18）：自動編號 —— store 第三張表、payload、回報路由 ──────
@@ -391,12 +457,33 @@ async function postTitles(paths, body) {
 	return res;
 }
 
+
+test("store：pinned／archived 去重、排序固定，壞值忽略", () => {
+	const paths = fixtureLoose();
+	const store = {
+		aliases: {},
+		sessionChains: {},
+		titles: {},
+		pinned: ["B", "A", "A", "", 3],
+		archived: ["Z"],
+	};
+	assert.equal(saveStore(paths.aliasesFile, store).ok, true);
+	const loaded = loadStore(paths.aliasesFile);
+	assert.deepEqual(loaded.pinned, ["A", "B"], "去重、移除空字串與非字串、排序固定");
+	assert.deepEqual(loaded.archived, ["Z"]);
+	// toggleInList：加與拿掉都不會動到原本的陣列
+	assert.deepEqual(toggleInList(loaded.pinned, "C", true), ["A", "B", "C"]);
+	assert.deepEqual(toggleInList(loaded.archived, "Z", false), []);
+});
+
 test("store：titles 第三張表可存可讀，且不影響其他兩張", () => {
 	const paths = fixtureLoose();
 	const store = {
 		aliases: updateAliases({}, "dsh-demo", "示範專案"),
 		sessionChains: { s1: "示範專案" },
 		titles: { s1: "我原本的標題" },
+		pinned: [],
+		archived: ["示範專案"],
 	};
 	assert.equal(saveStore(paths.aliasesFile, store).ok, true);
 	assert.deepEqual(loadStore(paths.aliasesFile), store);

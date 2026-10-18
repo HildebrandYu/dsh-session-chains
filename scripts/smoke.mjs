@@ -1439,6 +1439,43 @@ function containerCount(foot) {
 	store.delete("dsh.session-chains.suggest-dismissed");
 }
 
+// ── 2026-10-19：置頂／封存（卡片上看得到的部分）──────────────────────────
+{
+	const createCard = sandbox.captured.exports.createCard;
+	const writeSettings = sandbox.captured.exports.writeSettings;
+	const DEFAULT_SETTINGS = sandbox.captured.exports.DEFAULT_SETTINGS;
+	const quietNumbering = {
+		get: () => ({ paused: false, status: "idle", applied: 0, failed: 0, pending: 0, at: 0 }),
+		subscribe: () => () => {},
+		onApplied: () => () => {},
+		run: () => {},
+		togglePaused: () => false,
+		confirm: () => {},
+	};
+
+	// dsh-demo 置頂、dsh-demo-2 封存；排序故意用「名稱倒排」（正常會是 dsh-demo-2 在前）
+	writeSettings({ ...DEFAULT_SETTINGS, sortBy: "chain", sortDir: "desc" });
+	payloadForFetch = { ...DEMO_PAYLOAD, pinned: ["dsh-demo"], archived: ["dsh-demo-2"] };
+	const Card = createCard({ numbering: quietNumbering, openSession: () => {}, workspaceService: () => fakeWorkspace, openPanel: () => {} });
+	await settle(Card);
+
+	const rowNames = created.filter((node) => node.props?.["data-chain-row"] !== undefined).map((node) => node.props["data-chain-row"]);
+	check(!rowNames.includes("dsh-demo-2"), "封存的鏈不在卡片上", rowNames.join(","));
+	check(rowNames.includes("dsh-demo"), "沒封存的鏈照常顯示", rowNames.join(","));
+	check(rowNames[0] === "dsh-demo", "置頂的鏈排第一（即使排序鍵會把它排在後面）", rowNames.join(","));
+	check(created.some((node) => node.props?.["data-card-pin"] === "dsh-demo"), "置頂的鏈有 📌 標記");
+
+	// 取消置頂／取消封存 → 回到原本的顯示與排序
+	payloadForFetch = { ...DEMO_PAYLOAD, pinned: [], archived: [] };
+	await settle(createCard({ numbering: quietNumbering, openSession: () => {}, workspaceService: () => fakeWorkspace, openPanel: () => {} }));
+	const plain = created.filter((node) => node.props?.["data-chain-row"] !== undefined).map((node) => node.props["data-chain-row"]);
+	check(plain.includes("dsh-demo-2") && plain[0] === "dsh-demo-2", "取消置頂與封存後恢復原狀", plain.join(","));
+	check(created.filter((node) => node.props?.["data-card-pin"] !== undefined).length === 0, "沒有置頂就沒有 📌");
+
+	writeSettings(DEFAULT_SETTINGS);
+	payloadForFetch = DEMO_PAYLOAD;
+}
+
 // ── 2026-10-18：改名的正確介面是 sessions.using()（服務沒有 rename）──────────
 {
 	const renamer = sandbox.captured.exports.sessionRenamer;
@@ -1985,6 +2022,11 @@ console.log("");
 	check(names(sortChains(sample, "lastAt", "asc")) === "alpha,gamma,beta", "最後對話時間正排（舊→新）");
 	check(names(sortChains(sample, "lastAt", "desc")) === "beta,gamma,alpha", "最後對話時間倒排（新→舊，最近在用的在前）");
 	check(sample.map((entry) => entry.chain).join(",") === "beta,alpha,gamma", "排序不改原陣列");
+	// 2026-10-19 置頂：置頂是「位置」不是「排序」——任何排序鍵、任何方向都排最前。
+	check(names(sortChains(sample, "chain", "asc", ["gamma"])) === "gamma,alpha,beta", "置頂排最前（名稱正排）");
+	check(names(sortChains(sample, "created", "desc", ["alpha"])) === "alpha,beta,gamma", "置頂排最前（建立時間倒排，不影響其他條的相對順序）");
+	check(names(sortChains(sample, "count", "asc", ["beta", "gamma"])) === "gamma,beta,alpha", "多條置頂時，彼此照選定的排序鍵（場次數少→多：gamma 1、beta 2）");
+	check(names(sortChains(sample, "chain", "asc", [])) === "alpha,beta,gamma", "沒有置頂＝原本的排序");
 
 	// 設定：預設與壞值
 	store.delete("dsh.session-chains.settings");

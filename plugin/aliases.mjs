@@ -129,6 +129,29 @@ function cleanMap(value) {
 }
 
 /**
+ * 清一份「鏈名清單」（置頂／封存用）：只留非空字串、去重、排序固定。
+ *
+ * 排序不是為了好看 —— store 每次寫都會重排，才不會因為按的順序不同而讓檔案一直變。
+ * @param value - 讀進來的值（壞值一律當空陣列）
+ * @returns 乾淨的字串陣列
+ */
+function cleanList(value) {
+	const source = Array.isArray(value) ? value : [];
+	const seen = new Set();
+	for (const entry of source) {
+		if (typeof entry === "string" && entry !== "") seen.add(entry);
+	}
+	return [...seen].sort((left, right) => left.localeCompare(right));
+}
+
+/** 把一個名字加進清單或從清單拿掉（純函式；回傳新陣列）。 */
+export function toggleInList(list, name, on) {
+	const source = cleanList(list);
+	if (typeof name !== "string" || name === "") return source;
+	return on ? cleanList([...source, name]) : source.filter((entry) => entry !== name);
+}
+
+/**
  * 讀整份 store（三張表：改名對照表、手動歸鏈、原標題備份）。
  *
  * `titles`（2026-10-18）：自動編號會**真的改標題**，所以要留一份「被我們覆蓋前的原標題」，
@@ -143,9 +166,11 @@ export function loadStore(file) {
 			aliases: cleanMap(parsed?.aliases),
 			sessionChains: cleanMap(parsed?.sessionChains),
 			titles: cleanMap(parsed?.titles),
+			pinned: cleanList(parsed?.pinned),
+			archived: cleanList(parsed?.archived),
 		};
 	} catch {
-		return { aliases: {}, sessionChains: {}, titles: {} };
+		return { aliases: {}, sessionChains: {}, titles: {}, pinned: [], archived: [] };
 	}
 }
 
@@ -165,6 +190,8 @@ export function saveStore(file, store) {
 			aliases: cleanMap(store?.aliases),
 			sessionChains: cleanMap(store?.sessionChains),
 			titles: cleanMap(store?.titles),
+			pinned: cleanList(store?.pinned),
+			archived: cleanList(store?.archived),
 		};
 		writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 		renameSync(temporary, file);
@@ -192,7 +219,7 @@ export function loadAliases(file) {
 export function saveAliases(file, aliases) {
 	const current = loadStore(file);
 	// 第三張表（原標題備份）也要原樣帶回去，否則改名會把它洗掉。
-	return saveStore(file, { aliases, sessionChains: current.sessionChains, titles: current.titles });
+	return saveStore(file, { aliases, sessionChains: current.sessionChains, titles: current.titles, pinned: current.pinned, archived: current.archived });
 }
 
 /**

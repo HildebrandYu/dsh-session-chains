@@ -82,6 +82,38 @@ window.__ModuleLoader__.load({
 		 * @param to - 新名稱（伺服器會再驗一次）
 		 * @returns 宿主回的新 payload（或 null）
 		 */
+		/** 置頂端點（`{chain, on}`）。 */
+		function resolvePinEndpoint() {
+			const base = globalThis.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI;
+			return new URL("local/session-chains.pin", base).href;
+		}
+
+		/** 封存端點（`{chain, on}`）。 */
+		function resolveArchiveEndpoint() {
+			const base = globalThis.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI;
+			return new URL("local/session-chains.archive", base).href;
+		}
+
+		/**
+		 * 送出「置頂／封存」（兩個端點同一個 body 形狀）。
+		 * @param chain - 鏈名（伺服器會再過一次對照表）
+		 * @param on - true＝加上、false＝拿掉
+		 * @param kind - `pin` 或 `archive`
+		 * @returns 宿主回的新 payload（或 null）
+		 */
+		async function requestFlag(kind, chain, on) {
+			const response = await fetch(kind === "pin" ? resolvePinEndpoint() : resolveArchiveEndpoint(), {
+				method: "POST",
+				headers: { "content-type": "application/json", accept: "application/json" },
+				body: JSON.stringify({ chain, on }),
+			});
+			if (!response.ok) {
+				const payload = await response.json().catch(() => ({}));
+				throw new Error(payload?.error ?? `HTTP ${response.status}`);
+			}
+			return response.json().catch(() => null);
+		}
+
 		async function requestRename(from, to) {
 			const response = await fetch(resolveRenameEndpoint(), {
 				method: "POST",
@@ -584,9 +616,11 @@ window.__ModuleLoader__.load({
 		 * @param sortDir - `asc`／`desc`
 		 * @returns 排序後的新陣列
 		 */
-		function sortChains(chains, sortBy, sortDir) {
+		function sortChains(chains, sortBy, sortDir, pinned = []) {
 			const list = Array.isArray(chains) ? [...chains] : [];
 			const direction = sortDir === "desc" ? -1 : 1;
+			// 置頂是「位置」不是「排序」：不管選哪個排序鍵，置頂的鏈一律在最前面。
+			const pinnedSet = new Set(Array.isArray(pinned) ? pinned : []);
 			let collator = null;
 			try {
 				collator = new Intl.Collator("zh-Hant", { numeric: true, sensitivity: "base" });
@@ -599,6 +633,9 @@ window.__ModuleLoader__.load({
 				return collator === null ? left.localeCompare(right) : collator.compare(left, right);
 			};
 			list.sort((a, b) => {
+				const leftPinned = pinnedSet.has(String(a?.chain ?? "")) ? 1 : 0;
+				const rightPinned = pinnedSet.has(String(b?.chain ?? "")) ? 1 : 0;
+				if (leftPinned !== rightPinned) return rightPinned - leftPinned;
 				let compare = 0;
 				if (sortBy === "chain") compare = byName(a, b);
 				else if (sortBy === "count") compare = (Number(a?.count) || 0) - (Number(b?.count) || 0);
@@ -1334,8 +1371,14 @@ window.__ModuleLoader__.load({
 					}
 				};
 
-				const groups = (Array.isArray(data?.chains) ? data.chains : []).filter((group) => group.chain !== null);
-				const sortedGroups = sortChains(groups, settings.sortBy, settings.sortDir);
+				// 封存＝卡片不顯示（資料仍在 payload，面板的封存庫看得到）。
+				const archivedNames = new Set(Array.isArray(data?.archived) ? data.archived : []);
+				const pinnedNames = Array.isArray(data?.pinned) ? data.pinned : [];
+				const pinnedSet = new Set(pinnedNames);
+				const groups = (Array.isArray(data?.chains) ? data.chains : []).filter(
+					(group) => group.chain !== null && !archivedNames.has(group.chain),
+				);
+				const sortedGroups = sortChains(groups, settings.sortBy, settings.sortDir, pinnedNames);
 				const total = groups.reduce((sum, group) => sum + (Number(group.count) || 0), 0);
 				/** 整張卡片（所有已命名的鏈）的彙總狀態：收合時也看得到「哪裡在動」。 */
 				const allSessionIds = groups.flatMap((group) => (Array.isArray(group.sessions) ? group.sessions.map((session) => session.id) : []));
@@ -1533,6 +1576,9 @@ window.__ModuleLoader__.load({
 										label: aggregateStatus(statuses, (Array.isArray(group.sessions) ? group.sessions : []).map((session) => session.id))?.label,
 									}),
 									h("span", { style: { width: "10px", opacity: 0.6 } }, expanded ? "▾" : "▸"),
+									pinnedSet.has(group.chain)
+										? h("span", { "data-card-pin": group.chain, title: "置頂：永遠排在卡片最上面", style: { flex: "0 0 auto", fontSize: "10px" } }, "📌")
+										: null,
 									h("span", { style: { flex: "1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, group.chain),
 									h("span", { style: { opacity: 0.6, fontSize: "10px" } }, `${group.count} 場`),
 									// 就地改名的入口（與面板的「點鏈標籤改名」同一個寫入路徑）。
@@ -2561,6 +2607,8 @@ window.__ModuleLoader__.load({
 				const currentSessionId = useCurrentSession(open, workspaceService);
 				// hook 必須在 early return 之前呼叫（規則：hook 數跨 render 要一致）。
 				const [showUnmarked, setShowUnmarked] = React.useState(false);
+				// 封存庫：側欄卡片看不到封存的鏈，只有面板切到「封存庫」才列得出來、也才還原得回去。
+				const [showArchive, setShowArchive] = React.useState(false);
 				// 2026-10-18 使用者要求：面板要有搜尋、多選歸鏈、拖拉歸鏈。
 				const [query, setQuery] = React.useState("");
 				const [selected, setSelected] = React.useState([]);
@@ -2611,6 +2659,22 @@ window.__ModuleLoader__.load({
 				// 套用成功 → 重抓（標題變了，面板與左側欄都要跟上）。
 				React.useEffect(() => numbering.onApplied(() => reload()), [numbering]);
 				if (!open) return null;
+
+				/**
+				 * 送出「置頂／封存」。成功後重抓：卡片與面板吃的是同一份 payload。
+				 * @param chain - 鏈名
+				 * @param on - true＝加上、false＝拿掉
+				 * @param kind - `pin` 或 `archive`
+				 */
+				const saveFlag = async (chain, on, kind) => {
+					try {
+						await requestFlag(kind, chain, on);
+						setRenameError("");
+						reload();
+					} catch (error) {
+						setRenameError(`${kind === "pin" ? "置頂" : "封存"}失敗：${error?.message ?? error}`);
+					}
+				};
 
 				/** 送出改名。成功就重抓（面板立刻顯示新名字）。 */
 				const saveRename = async (from, to) => {
@@ -2729,7 +2793,15 @@ window.__ModuleLoader__.load({
 				};
 
 				const allChains = Array.isArray(data?.chains) ? data.chains : [];
-				const baseChains = showUnmarked ? allChains : allChains.filter((chain) => chain.chain !== null);
+				const archivedSet = new Set(Array.isArray(data?.archived) ? data.archived : []);
+				const pinnedNames = Array.isArray(data?.pinned) ? data.pinned : [];
+				const pinnedSet = new Set(pinnedNames);
+				const archivedCount = allChains.filter((chain) => chain.chain !== null && archivedSet.has(chain.chain)).length;
+				const namedChains = showUnmarked ? allChains : allChains.filter((chain) => chain.chain !== null);
+				// 在封存庫就只看封存的；在主清單就完全不顯示封存的。
+				const baseChains = namedChains.filter((chain) =>
+					showArchive ? chain.chain !== null && archivedSet.has(chain.chain) : !archivedSet.has(chain.chain),
+				);
 				// 搜尋（2026-10-18）：鏈名命中就整條留著；否則只留標題／第一句話／id／cwd 命中的場次。
 				// 不改 `data`（重抓就回來），只做這一輪的顯示過濾。
 				const normalizedQuery = query.trim().toLowerCase();
@@ -2750,7 +2822,7 @@ window.__ModuleLoader__.load({
 								return [{ ...chain, sessions, count: nameHit ? chain.count : sessions.length }];
 							});
 				// 排序在過濾之後：搜尋結果也照同一套規則。
-				const chains = sortChains(filteredChains, settings.sortBy, settings.sortDir);
+				const chains = sortChains(filteredChains, settings.sortBy, settings.sortDir, pinnedNames);
 				const unmarkedCount = allChains
 					.filter((chain) => chain.chain === null)
 					.reduce((sum, chain) => sum + chain.count, 0);
@@ -2911,6 +2983,19 @@ window.__ModuleLoader__.load({
 									{ type: "button", onClick: () => setShowUnmarked((value) => !value), style: buttonStyle },
 									showUnmarked ? "收起未標記" : `未標記 ${unmarkedCount}`,
 								)
+							: null,
+						archivedCount > 0 || showArchive
+							? h(
+										"button",
+										{
+											"data-sc-archive-toggle": showArchive ? "open" : "closed",
+											type: "button",
+											title: showArchive ? "回到正常鏈清單" : "封存的鏈只在這裡看得到，也在這裡還原",
+											onClick: () => setShowArchive((value) => !value),
+											style: showArchive ? { ...buttonStyle, borderColor: "#8a4b00", color: "#8a4b00" } : buttonStyle,
+										},
+										showArchive ? "← 回鏈清單" : `封存庫 ${archivedCount}`,
+									)
 							: null,
 						h(
 							"button",
@@ -3373,6 +3458,38 @@ window.__ModuleLoader__.load({
 												unmarked ? "未標記" : chain.chain,
 											),
 											unmarked ? null : h("span", { style: { color: "#8a4b00", fontSize: "10px" } }, "✎"),
+										unmarked
+											? null
+											: h(
+													"button",
+													{
+														"data-chain-pin": chain.chain,
+														type: "button",
+														title: pinnedSet.has(chain.chain) ? "取消置頂" : "置頂（永遠排在清單最前面）",
+														onClick: (event) => {
+															event.stopPropagation();
+															saveFlag(chain.chain, !pinnedSet.has(chain.chain), "pin");
+														},
+														style: { ...buttonStyle, fontSize: "10px", padding: "0 3px" },
+													},
+													pinnedSet.has(chain.chain) ? "📌" : "📍",
+												),
+										unmarked
+											? null
+											: h(
+													"button",
+													{
+														"data-chain-archive": chain.chain,
+														type: "button",
+														title: showArchive ? "從封存庫還原" : "封存（從卡片收起，面板封存庫還原得回來）",
+														onClick: (event) => {
+															event.stopPropagation();
+															saveFlag(chain.chain, !showArchive, "archive");
+														},
+														style: { ...buttonStyle, fontSize: "10px", padding: "0 3px" },
+													},
+													showArchive ? "還原" : "🗄",
+												),
 										)
 									: h("input", {
 											"data-chain-input": "",

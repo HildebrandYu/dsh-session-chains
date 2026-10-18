@@ -1,6 +1,6 @@
 {
   "name": "session-chains",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 交接鏈面板：把互相交接的對話依「鏈」聚在一起、編號、一鍵切換，並在上下文到門檻時提醒或自動交接。",
   "type": "module",
   "main": "./plugin/index.mjs",

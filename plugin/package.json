@@ -1,0 +1,48 @@
+{
+  "name": "session-chains",
+  "version": "0.1.0",
+  "description": "DSH 交接鏈面板：把互相交接的對話依「鏈」聚在一起、編號、一鍵切換，並在上下文到門檻時提醒或自動交接。",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": {
+      "default": "./index.mjs"
+    },
+    "./client": {
+      "default": "./client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "chains.mjs",
+    "aliases.mjs",
+    "numbering.mjs",
+    "suggest.mjs",
+    "usage-aggregate.mjs",
+    "usage-route.mjs",
+    "client.js",
+    "package.json"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "session",
+    "handoff",
+    "context",
+    "token"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HildebrandYu/dsh-session-chains.git"
+  },
+  "homepage": "https://github.com/HildebrandYu/dsh-session-chains#readme",
+  "license": "MIT",
+  "dependencies": {}
+}

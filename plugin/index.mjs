@@ -11,7 +11,7 @@
  */
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyAliases, applyAssignments, canonicalOf, loadStore, normalizeName, renderRegistry, saveStore, updateAliases } from "./aliases.mjs";
 import { groupByChain, readSessions } from "./chains.mjs";
@@ -39,14 +39,26 @@ export const NEXT_PROMPT_PATH = "/local/session-chains.next-prompt";
 /** 專案根目錄＝本檔的上一層（`plugin/index.mjs` → 專案根）。 */
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-/** 對照表預設路徑（改名寫在這裡；在專案內的 `.state/`，不碰工作區其他檔案）。 */
-export const DEFAULT_ALIASES_FILE = join(PROJECT_ROOT, ".state", "aliases.json");
+/**
+ * 狀態要放哪裡（`aliases.json`、`next-prompt.txt`、`鏈代號.md`）。
+ *
+ * 開發時（本機 `file://` 直掛）就放專案根，行為跟以前完全一樣。
+ * 但從插件市場／`dsh plugin add` 安裝時，專案根在 `node_modules/` 裡 —— 升級或重裝會整包換掉，
+ * 鏈的代號與手動歸鏈會跟著消失。所以**偵測到自己在 node_modules 底下就改住 `$DSH_HOME/session-chains`**，
+ * 讓狀態活得比套件久。`SESSION_CHAINS_HOME` 可以整個蓋掉這個判斷。
+ */
+const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), ".dsh");
+const INSTALLED = PROJECT_ROOT.split(sep).includes("node_modules");
+const STATE_ROOT = process.env.SESSION_CHAINS_HOME ?? (INSTALLED ? join(DSH_HOME, "session-chains") : PROJECT_ROOT);
 
-/** 接續提示詞的預設檔案（放在專案的 `.state/`，不碰工作區其他檔案）。 */
-export const DEFAULT_NEXT_PROMPT_FILE = join(PROJECT_ROOT, ".state", "next-prompt.txt");
+/** 對照表預設路徑（改名寫在這裡；放在 `.state/`，不碰工作區其他檔案）。 */
+export const DEFAULT_ALIASES_FILE = join(STATE_ROOT, ".state", "aliases.json");
+
+/** 接續提示詞的預設檔案（放在 `.state/`，不碰工作區其他檔案）。 */
+export const DEFAULT_NEXT_PROMPT_FILE = join(STATE_ROOT, ".state", "next-prompt.txt");
 
 /** 對照表 md 的預設路徑（給人與 AI 看）。 */
-export const DEFAULT_REGISTRY_FILE = join(PROJECT_ROOT, "鏈代號.md");
+export const DEFAULT_REGISTRY_FILE = join(STATE_ROOT, "鏈代號.md");
 
 /**
  * Config：手寫 standard-schema（不 import `@deepseek-ai/schemastery`——本插件由工作區的

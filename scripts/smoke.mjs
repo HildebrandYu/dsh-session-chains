@@ -1465,6 +1465,16 @@ function containerCount(foot) {
 	check(rowNames[0] === "dsh-demo", "置頂的鏈排第一（即使排序鍵會把它排在後面）", rowNames.join(","));
 	check(created.some((node) => node.props?.["data-card-pin"] === "dsh-demo"), "置頂的鏈有 📌 標記");
 
+	// 側欄直接置頂（2026-10-19 使用者要求）：卡片列自己有一顆切換，按了就送 .pin
+	const pinToggle = created.find((node) => node.props?.["data-card-chain-pin"] === "dsh-demo");
+	check(pinToggle !== undefined, "卡片列有置頂切換（不必進面板）");
+	const pinsBefore = fetchCalls.filter((call) => call.url.includes("session-chains.pin")).length;
+	pinToggle?.props?.onClick?.({ stopPropagation: () => {} });
+	await settle(Card);
+	const sentPin = fetchCalls.filter((call) => call.url.includes("session-chains.pin")).pop();
+	check(fetchCalls.filter((call) => call.url.includes("session-chains.pin")).length === pinsBefore + 1, "按一下送出 POST .pin");
+	check(String(sentPin?.init?.body ?? "").includes('"chain":"dsh-demo"') && String(sentPin?.init?.body ?? "").includes('"on":false'), "已置頂的鏈再按＝取消置頂（on:false）", String(sentPin?.init?.body ?? ""));
+
 	// 取消置頂／取消封存 → 回到原本的顯示與排序
 	payloadForFetch = { ...DEMO_PAYLOAD, pinned: [], archived: [] };
 	await settle(createCard({ numbering: quietNumbering, openSession: () => {}, workspaceService: () => fakeWorkspace, openPanel: () => {} }));

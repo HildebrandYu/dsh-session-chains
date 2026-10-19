@@ -1581,6 +1581,28 @@ window.__ModuleLoader__.load({
 										: null,
 									h("span", { style: { flex: "1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, group.chain),
 									h("span", { style: { opacity: 0.6, fontSize: "10px" } }, `${group.count} 場`),
+									// 置頂（2026-10-19 使用者要求：直接在側欄按，不必進面板）。
+									h(
+										"span",
+										{
+											"data-card-chain-pin": group.chain,
+											title: pinnedSet.has(group.chain) ? "取消置頂" : "置頂（永遠排在卡片最上面）",
+											onClick: (event) => {
+												event.stopPropagation();
+												requestFlag("pin", group.chain, !pinnedSet.has(group.chain))
+													.then(() => reload())
+													.catch(() => {});
+											},
+											style: {
+												cursor: "pointer",
+												flex: "0 0 auto",
+												fontSize: "10px",
+												opacity: pinnedSet.has(group.chain) ? 1 : 0.35,
+												padding: "0 2px",
+											},
+										},
+										pinnedSet.has(group.chain) ? "📌" : "📍",
+									),
 									// 就地改名的入口（與面板的「點鏈標籤改名」同一個寫入路徑）。
 									h(
 										"span",

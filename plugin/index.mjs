@@ -307,6 +307,11 @@ export function createHandler({
 				aliases: store.aliases,
 				sessionChains: store.sessionChains,
 				titles: store.titles,
+				// 置頂／封存：跟 buildPayload 一樣用 canonical 名回傳（改名後仍然生效）。
+				// 2026-10-19 修：GET 這支是卡片與面板真正吃的資料，之前只改了 POST 那支，
+				// 所以按了置頂「後端有存、前端永遠收不到」，畫面看起來就是按不動。
+				pinned: (Array.isArray(store.pinned) ? store.pinned : []).map((name) => canonicalOf(name, store.aliases)),
+				archived: (Array.isArray(store.archived) ? store.archived : []).map((name) => canonicalOf(name, store.aliases)),
 				sessions: mapped,
 				chains,
 				suggestions: suggestFor(chains),

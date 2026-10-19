@@ -1298,6 +1298,9 @@ window.__ModuleLoader__.load({
 				// 就地改名（2026-10-18 使用者回報「要改名只能再進去下一層，太麻煩」）：
 				// 卡片上點鏈列右側的 `✎` 直接變成輸入框，Enter 送出，不必開浮層。
 				const [editing, setEditing] = React.useState(null);
+				// 封存是兩段式確認：第一次按只把那一列變成「確定封存？」，第二次按才真的送。
+				// 不用 window.confirm —— Electron/iframe 底下不一定彈得出來，彈不出來就等於沒有確認。
+				const [archiveAsk, setArchiveAsk] = React.useState("");
 				const [draft, setDraft] = React.useState("");
 				const [renameError, setRenameError] = React.useState("");
 				// 收合時只顯示「幾條鏈／幾場」，不需要勤抓：5 分鐘。展開才 30 秒。
@@ -1576,9 +1579,6 @@ window.__ModuleLoader__.load({
 										label: aggregateStatus(statuses, (Array.isArray(group.sessions) ? group.sessions : []).map((session) => session.id))?.label,
 									}),
 									h("span", { style: { width: "10px", opacity: 0.6 } }, expanded ? "▾" : "▸"),
-									pinnedSet.has(group.chain)
-										? h("span", { "data-card-pin": group.chain, title: "置頂：永遠排在卡片最上面", style: { flex: "0 0 auto", fontSize: "10px" } }, "📌")
-										: null,
 									h("span", { style: { flex: "1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, group.chain),
 									h("span", { style: { opacity: 0.6, fontSize: "10px" } }, `${group.count} 場`),
 									// 置頂（2026-10-19 使用者要求：直接在側欄按，不必進面板）。
@@ -1597,12 +1597,61 @@ window.__ModuleLoader__.load({
 												cursor: "pointer",
 												flex: "0 0 auto",
 												fontSize: "10px",
-												opacity: pinnedSet.has(group.chain) ? 1 : 0.35,
+												opacity: pinnedSet.has(group.chain) ? 1 : 0.3,
 												padding: "0 2px",
 											},
 										},
 										pinnedSet.has(group.chain) ? "📌" : "📍",
 									),
+									// 封存（2026-10-19 使用者要求：側欄就能按，**按了先確認**）。
+									// 兩段式：第一次按把這一列換成「確定封存？」＋「取消」，第二次按才真的送。
+									archiveAsk === group.chain
+										? h(
+												"span",
+												{ "data-card-chain-archive": group.chain, "data-archive-confirm": "ask", style: { alignItems: "center", display: "inline-flex", gap: "3px" } },
+												h(
+													"span",
+													{
+														"data-archive-confirm-go": group.chain,
+														title: "封存：從側欄收起，不會刪掉任何對話；面板的封存庫可以還原",
+														onClick: (event) => {
+															event.stopPropagation();
+															requestFlag("archive", group.chain, true)
+																.then(() => {
+																	setArchiveAsk("");
+																	reload();
+																})
+																.catch(() => {});
+														},
+														style: { background: "#8a4b00", borderRadius: "3px", color: "#fff", cursor: "pointer", fontSize: "10px", padding: "0 4px", whiteSpace: "nowrap" },
+													},
+													"確定封存？",
+												),
+												h(
+													"span",
+													{
+														onClick: (event) => {
+															event.stopPropagation();
+															setArchiveAsk("");
+														},
+														style: { color: "var(--dsw-alias-label-tertiary)", cursor: "pointer", fontSize: "10px" },
+													},
+													"取消",
+												),
+											)
+										: h(
+												"span",
+												{
+													"data-card-chain-archive": group.chain,
+													title: `封存「${group.chain}」：從側欄收起，之後可在面板的封存庫還原`,
+													onClick: (event) => {
+														event.stopPropagation();
+														setArchiveAsk(group.chain);
+													},
+													style: { cursor: "pointer", flex: "0 0 auto", fontSize: "10px", opacity: 0.45, padding: "0 2px" },
+												},
+												"🗄",
+											),
 									// 就地改名的入口（與面板的「點鏈標籤改名」同一個寫入路徑）。
 									h(
 										"span",

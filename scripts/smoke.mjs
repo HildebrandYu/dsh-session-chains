@@ -1463,7 +1463,12 @@ function containerCount(foot) {
 	check(!rowNames.includes("dsh-demo-2"), "封存的鏈不在卡片上", rowNames.join(","));
 	check(rowNames.includes("dsh-demo"), "沒封存的鏈照常顯示", rowNames.join(","));
 	check(rowNames[0] === "dsh-demo", "置頂的鏈排第一（即使排序鍵會把它排在後面）", rowNames.join(","));
-	check(created.some((node) => node.props?.["data-card-pin"] === "dsh-demo"), "置頂的鏈有 📌 標記");
+	check(created.some((node) => node.props?.["data-card-pin"] !== undefined) === false, "左側沒有圖釘（置頂只在右側顯示）");
+	check(
+		created.find((node) => node.props?.["data-card-chain-pin"] === "dsh-demo")?.children?.includes?.("📌") === true ||
+			String(created.find((node) => node.props?.["data-card-chain-pin"] === "dsh-demo")?.children?.[0] ?? "") === "📌",
+		"右側的置頂鈕在置頂時顯示 📌",
+	);
 
 	// 側欄直接置頂（2026-10-19 使用者要求）：卡片列自己有一顆切換，按了就送 .pin
 	const pinToggle = created.find((node) => node.props?.["data-card-chain-pin"] === "dsh-demo");
@@ -1475,12 +1480,24 @@ function containerCount(foot) {
 	check(fetchCalls.filter((call) => call.url.includes("session-chains.pin")).length === pinsBefore + 1, "按一下送出 POST .pin");
 	check(String(sentPin?.init?.body ?? "").includes('"chain":"dsh-demo"') && String(sentPin?.init?.body ?? "").includes('"on":false'), "已置頂的鏈再按＝取消置頂（on:false）", String(sentPin?.init?.body ?? ""));
 
-	// 取消置頂／取消封存 → 回到原本的顯示與排序
-	payloadForFetch = { ...DEMO_PAYLOAD, pinned: [], archived: [] };
-	await settle(createCard({ numbering: quietNumbering, openSession: () => {}, workspaceService: () => fakeWorkspace, openPanel: () => {} }));
-	const plain = created.filter((node) => node.props?.["data-chain-row"] !== undefined).map((node) => node.props["data-chain-row"]);
-	check(plain.includes("dsh-demo-2") && plain[0] === "dsh-demo-2", "取消置頂與封存後恢復原狀", plain.join(","));
-	check(created.filter((node) => node.props?.["data-card-pin"] !== undefined).length === 0, "沒有置頂就沒有 📌");
+	// 封存：側欄就有一顆，兩段式確認（第一次按只問，第二次按才送）
+	const archiveBtn = created.find((node) => node.props?.["data-card-chain-archive"] === "dsh-demo");
+	check(archiveBtn !== undefined, "卡片列有封存鈕（不必進面板）");
+	const archivesBefore = fetchCalls.filter((call) => call.url.includes("session-chains.archive")).length;
+	archiveBtn?.props?.onClick?.({ stopPropagation: () => {} });
+	await settle(Card);
+	check(
+		fetchCalls.filter((call) => call.url.includes("session-chains.archive")).length === archivesBefore,
+		"第一次按只問、不會封存",
+	);
+	const goArchive = created.find((node) => node.props?.["data-archive-confirm-go"] === "dsh-demo");
+	check(goArchive !== undefined, "出現「確定封存？」可再按一次");
+	goArchive?.props?.onClick?.({ stopPropagation: () => {} });
+	await settle(Card);
+	check(
+		fetchCalls.filter((call) => call.url.includes("session-chains.archive")).length === archivesBefore + 1,
+		"第二次按才送出 POST .archive",
+	);
 
 	writeSettings(DEFAULT_SETTINGS);
 	payloadForFetch = DEMO_PAYLOAD;

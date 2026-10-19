@@ -378,6 +378,31 @@ const joined = texts.join(" | ");
 console.log(`  面板看得到的字：${joined}`);
 check(texts.includes("dsh-demo"), "畫出鏈代號 dsh-demo");
 
+// 面板的封存也是兩段式（2026-10-19 使用者要求，與側欄一致）
+{
+	const before = fetchCalls.filter((call) => call.url.includes("session-chains.archive")).length;
+	const askBtn = created.find((node) => node.props?.["data-chain-archive"] === "dsh-demo");
+	check(askBtn !== undefined, "面板每列有封存鈕");
+	askBtn?.props?.onClick?.({ stopPropagation: () => {} });
+	await settle(panel.component);
+	check(fetchCalls.filter((call) => call.url.includes("session-chains.archive")).length === before, "面板第一次按只問、不會封存");
+	check(created.some((node) => node.props?.["data-archive-cancel"] === "dsh-demo"), "面板出現「取消」");
+	const goBtn = created.find(
+		(node) => node.props?.["data-chain-archive"] === "dsh-demo" && String(node.children?.[0] ?? "").includes("確定封存"),
+	);
+	check(goBtn !== undefined, "按鈕變成「確定封存？」");
+	goBtn?.props?.onClick?.({ stopPropagation: () => {} });
+	await settle(panel.component);
+	check(
+		fetchCalls.filter((call) => call.url.includes("session-chains.archive")).length === before + 1,
+		"面板第二次按才送出 POST .archive",
+	);
+	// 收尾：把 state 清掉（再按一次取消不會送）
+	created
+		.filter((node) => node.props?.["data-archive-cancel"] === "dsh-demo")
+		.forEach((node) => node.props?.onClick?.({ stopPropagation: () => {} }));
+}
+
 
 check(texts.includes("起點"), "起點場次標了「起點」（handoffTo === 本鏈）");
 check(texts.includes("幫我做一個示範專案") && texts.includes("【接續提示詞】鏈=dsh-demo 先讀 README"), "兩場都列出第一句話");

@@ -2680,6 +2680,8 @@ window.__ModuleLoader__.load({
 				const [showUnmarked, setShowUnmarked] = React.useState(false);
 				// 封存庫：側欄卡片看不到封存的鏈，只有面板切到「封存庫」才列得出來、也才還原得回去。
 				const [showArchive, setShowArchive] = React.useState(false);
+				// 面板的封存也兩段式（與側欄一致）；還原不必問。
+				const [panelArchiveAsk, setPanelArchiveAsk] = React.useState("");
 				// 2026-10-18 使用者要求：面板要有搜尋、多選歸鏈、拖拉歸鏈。
 				const [query, setQuery] = React.useState("");
 				const [selected, setSelected] = React.useState([]);
@@ -3552,15 +3554,48 @@ window.__ModuleLoader__.load({
 													{
 														"data-chain-archive": chain.chain,
 														type: "button",
-														title: showArchive ? "從封存庫還原" : "封存（從卡片收起，面板封存庫還原得回來）",
+														title: showArchive
+															? "從封存庫還原"
+															: panelArchiveAsk === chain.chain
+																? "再按一次＝確定封存（不會刪掉任何對話）"
+																: "封存（從卡片收起，面板封存庫還原得回來）",
 														onClick: (event) => {
 															event.stopPropagation();
-															saveFlag(chain.chain, !showArchive, "archive");
+															if (showArchive) {
+																saveFlag(chain.chain, false, "archive");
+																return;
+															}
+															// 第一次只問，第二次才送。
+															if (panelArchiveAsk !== chain.chain) {
+																setPanelArchiveAsk(chain.chain);
+																return;
+															}
+															saveFlag(chain.chain, true, "archive");
+															setPanelArchiveAsk("");
 														},
-														style: { ...buttonStyle, fontSize: "10px", padding: "0 3px" },
+														style:
+															!showArchive && panelArchiveAsk === chain.chain
+																? { ...buttonStyle, background: "#8a4b00", borderColor: "#8a4b00", color: "#fff", fontSize: "10px", padding: "0 3px" }
+																: { ...buttonStyle, fontSize: "10px", padding: "0 3px" },
 													},
-													showArchive ? "還原" : "🗄",
+													showArchive ? "還原" : panelArchiveAsk === chain.chain ? "確定封存？" : "🗄",
 												),
+												// 取消：只在「確定封存？」那一步出現（與側欄一致的兩段式）
+												!showArchive && panelArchiveAsk === chain.chain
+													? h(
+															"button",
+															{
+																"data-archive-cancel": chain.chain,
+																type: "button",
+																onClick: (event) => {
+																	event.stopPropagation();
+																	setPanelArchiveAsk("");
+																},
+																style: { ...buttonStyle, fontSize: "10px", padding: "0 3px" },
+															},
+															"取消",
+														)
+													: null,
 										)
 									: h("input", {
 											"data-chain-input": "",

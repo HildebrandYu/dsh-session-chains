@@ -15,7 +15,7 @@ import { zstdCompressSync } from "node:zlib";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { extractChain, extractOutChain, groupByChain, readSessions, undecorate } from "../plugin/chains.mjs";
+import { extractChain, extractOutChain, groupByChain, modelOf, readSessions, undecorate } from "../plugin/chains.mjs";
 
 /** 造一則使用者訊息事件。 */
 function userEvent(text, time = 0) {
@@ -229,6 +229,41 @@ test("groupByChain：鏈的 lastAt＝組內最後活動時間，排序也照它"
 	assert.equal(x.lastAt, 900, "取組內最大值（b 比較晚開始，但 a 比較晚有動）");
 	assert.equal(y.lastAt, 500);
 	assert.equal(groups[0].chain, "x", "最後活動較新的鏈排前面");
+});
+
+
+// ── 2026-10-20：交接要沿用這一場的模型（新對話預設會吃部署的雲端模型）────────
+
+test("modelOf：取最後一筆 model/selection（使用者最後挑的模型）", () => {
+	const events = [
+		{ type: "request/header", data: { header: { config: { provider: "deepseek-account", model: "deepseek-flash", reasoningEffort: "high" } } } },
+		{ type: "model/selection", data: { provider: "rapid-mlx-worker", model: "qwen3.5-35b-4bit" } },
+	];
+	assert.deepEqual(modelOf(events), { provider: "rapid-mlx-worker", model: "qwen3.5-35b-4bit" });
+});
+
+test("modelOf：沒有 model/selection 就退回最後一筆 request/header 的 config", () => {
+	const events = [
+		{ type: "request/header", data: { header: { config: { provider: "deepseek-account", model: "deepseek-flash", reasoningEffort: "high" } } } },
+		{ type: "request/header", data: { header: { config: { provider: "rapid-mlx", model: "qwen3.8-27b-4bit" } } } },
+	];
+	assert.deepEqual(modelOf(events), { provider: "rapid-mlx", model: "qwen3.8-27b-4bit" });
+});
+
+test("modelOf：缺欄位、空字串、壞事件都不算（回 null 而不是半個選擇）", () => {
+	assert.equal(modelOf([]), null);
+	assert.equal(modelOf([{ type: "model/selection", data: { provider: "", model: "x" } }]), null);
+	assert.equal(modelOf([{ type: "model/selection", data: { provider: "p" } }]), null);
+	assert.equal(modelOf([{ type: "model/selection", data: { model: "m" } }]), null);
+	assert.equal(modelOf([{ type: "request/header", data: {} }, null, { type: "other" }]), null);
+});
+
+test("modelOf：後來的 model/selection 蓋掉前面的（與標題同一個「最後一筆為準」）", () => {
+	const events = [
+		{ type: "model/selection", data: { provider: "a", model: "one" } },
+		{ type: "model/selection", data: { provider: "b", model: "two", reasoningEffort: "medium" } },
+	];
+	assert.deepEqual(modelOf(events), { provider: "b", model: "two", reasoningEffort: "medium" });
 });
 
 // ── 2026-10-19：同一場有多個格式版本時，要讀版本號最大的 ────────────────

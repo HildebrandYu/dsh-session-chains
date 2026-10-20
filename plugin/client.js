@@ -2592,26 +2592,67 @@ window.__ModuleLoader__.load({
 			}
 
 			/**
-			 * 目前這一場所屬的鏈（讀 `/local/session-chains` 的 `sessions[].chain`）。
+			 * 目前這一場的鏈與模型（讀 `/local/session-chains` 的 `sessions[]`）。
 			 *
 			 * 為什麼要問後端而不是自己從第一句話解析：使用者可以在面板上**歸鏈／改名**，
 			 * 那才是他心裡的那條鏈；第一句話的 `鏈=` 可能早就是舊代號。
 			 * 2026-10-20 使用者回報「自動交接會亂跳」＝指令沒帶鏈，AI 沿用舊代號，
 			 * `canonicalOf` 再把它併進另一條鏈（本地部署測試004 → 模擬聲音工程）。
+			 * 模型同理：新對話吃的是部署預設（雲端），要沿用這一場的本地模型就得先讀到它。
 			 * @param {string|null} sessionId - 目前這一場
-			 * @returns 鏈名或 null（未標記／讀不到）
+			 * @returns `{chain: string|null, model: object|null}`（讀不到就兩個 null）
 			 */
-			const resolveCurrentChain = async (sessionId) => {
-				if (typeof sessionId !== "string" || sessionId === "") return null;
+			const resolveCurrentSession = async (sessionId) => {
+				const empty = { chain: null, model: null };
+				if (typeof sessionId !== "string" || sessionId === "") return empty;
 				try {
 					const response = await fetch(resolveEndpoint(), { headers: { accept: "application/json" } });
-					if (!response.ok) return null;
+					if (!response.ok) return empty;
 					const data = await response.json().catch(() => null);
 					const list = Array.isArray(data?.sessions) ? data.sessions : [];
 					const entry = list.find((item) => item?.id === sessionId);
-					return typeof entry?.chain === "string" && entry.chain !== "" ? entry.chain : null;
+					return {
+						chain: typeof entry?.chain === "string" && entry.chain !== "" ? entry.chain : null,
+						model: entry?.model ?? null,
+					};
+				} catch {
+					return empty;
+				}
+			};
+
+			/** 客戶端的 Session Remote（`ctx.remote.session`）：選模型要用它。 */
+			const sessionRemote = () => {
+				try {
+					return ctx.remote?.session ?? ctx.get?.("remote")?.session ?? null;
 				} catch {
 					return null;
+				}
+			};
+
+			/**
+			 * 把「這一場的模型」選給新對話（在送出第一句**之前**）。
+			 *
+			 * `sessions.create` 不吃模型參數，新對話一律先吃部署預設（雲端）；模型選擇是
+			 * 每一場各自的（`selectModel`），所以要在第一句之前補上，否則第一輪就跑錯模型。
+			 * 失敗不擋交接（頂多跟以前一樣吃預設），只回報 false 給呼叫端。
+			 * @param {string} sessionId - 新對話
+			 * @param {object|null} model - `{provider, model, reasoningEffort?}`
+			 * @returns 有沒有設定成功
+			 */
+			const applyModelSelection = async (sessionId, model) => {
+				if (typeof model?.provider !== "string" || typeof model?.model !== "string") return false;
+				const remote = sessionRemote();
+				if (typeof remote?.selectModel !== "function") return false;
+				try {
+					const result = await remote.selectModel({
+						sessionId,
+						provider: model.provider,
+						model: model.model,
+						...(typeof model.reasoningEffort === "string" && model.reasoningEffort !== "" ? { reasoningEffort: model.reasoningEffort } : {}),
+					});
+					return result?.ok !== false;
+				} catch {
+					return false;
 				}
 			};
 
@@ -2641,7 +2682,12 @@ window.__ModuleLoader__.load({
 				const currentId = readCurrentSessionId(workspace);
 				const snapshot = sessions.list?.getSnapshot?.();
 				const cwd = currentId !== null ? snapshot?.byId?.[currentId]?.cwd : undefined;
+				// 這一場的鏈與模型要在建立前先讀好：模型必須在第一句之前選給新對話。
+				const source = await resolveCurrentSession(currentId);
 				const sessionId = await sessions.create(cwd !== undefined ? { cwd } : {});
+				// 2026-10-20（使用者回報「交接後變雲端模型」）：新對話吃部署預設（雲端），
+				// 這一場用本地模型時要先把選擇複製過去，否則第一輪就跑錯模型。
+				await applyModelSelection(sessionId, source.model);
 				await sessions.using(sessionId, { source: "workspaceOperation" }, async (reference) => {
 					const result = await reference.binding.session.prompt([{ type: "text", text: prompt }], "queue");
 					if (result?.ok !== true) throw new Error(result?.error?.message ?? "訊息送出失敗");
@@ -2649,12 +2695,11 @@ window.__ModuleLoader__.load({
 				// 2026-10-20（使用者回報「自動交接會亂跳」）：交接詞裡的鏈代號是 AI 寫的，
 				// 可能還是舊代號（例：本地部署測試004 的 40-MediaProduction）→ `canonicalOf` 會把它
 				// 併到別條鏈。這一場在哪條鏈，新場次就歸回哪條鏈：直接寫一筆歸鏈，不靠 AI 寫對。
-				const sourceChain = await resolveCurrentChain(currentId);
-				if (sourceChain !== null) {
+				if (source.chain !== null) {
 					await fetch(resolveAssignEndpoint(), {
 						method: "POST",
 						headers: { "content-type": "application/json", accept: "application/json" },
-						body: JSON.stringify({ sessionId, chain: sourceChain }),
+						body: JSON.stringify({ sessionId, chain: source.chain }),
 					}).catch(() => {});
 				}
 				// 用過就清掉：避免下一次按到舊的交接詞。
@@ -2688,7 +2733,7 @@ window.__ModuleLoader__.load({
 				}
 				// 2026-10-20：把「這一場在哪條鏈」直接寫進指令。留給 AI 自己猜會出事 ——
 				// 它會沿用第一句話的舊代號（或專案目錄名），`canonicalOf` 再併到別條鏈。
-				const chain = await resolveCurrentChain(sessionId);
+				const { chain } = await resolveCurrentSession(sessionId);
 				await sessions.using(sessionId, { source: "workspaceOperation" }, async (reference) => {
 					const result = await reference.binding.session.prompt([{ type: "text", text: handoffPrompt({ chain }) }], "queue");
 					if (result?.ok !== true) throw new Error(result?.error?.message ?? "訊息送出失敗");

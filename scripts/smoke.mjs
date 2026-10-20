@@ -280,6 +280,17 @@ const openCalls = [];
 const renameCalls = [];
 const createCalls = [];
 const promptCalls = [];
+/** 交接時「把這一場的模型選給新對話」的呼叫（2026-10-20）。 */
+const selectModelCalls = [];
+/** 呼叫順序的時間軸（驗「先選模型、再送第一句」）。 */
+const timeline = [];
+const fakeRemoteSession = {
+	selectModel: async (request) => {
+		selectModelCalls.push(request);
+		timeline.push({ kind: "selectModel", sessionId: request?.sessionId });
+		return { ok: true };
+	},
+};
 const fakeSessions = {
 	rename: async (sessionId, title) => {
 		renameCalls.push({ sessionId, title });
@@ -296,6 +307,7 @@ const fakeSessions = {
 				session: {
 					prompt: async (content, mode) => {
 						promptCalls.push({ sessionId, content, mode });
+						timeline.push({ kind: "prompt", sessionId });
 						return { ok: true };
 					},
 				},
@@ -334,6 +346,8 @@ const ctx = {
 		if (name === "uiSession") return fakeUiSession;
 		return undefined;
 	},
+	// 內建的 Session Remote（選模型）：client 外掛用 ctx.remote.session 呼叫。
+	remote: { session: fakeRemoteSession },
 	slots: {
 		inject(name, callback) {
 			callback();
@@ -1436,6 +1450,40 @@ function containerCount(foot) {
 			"新開的場次被歸回這一條鏈（POST .assign 本地部署測試）",
 			JSON.stringify(assignedBodies),
 		);
+
+		// 2026-10-20 使用者回報「用本地模型，交接後新對話變雲端」：
+		// 新對話要先選上這一場的模型，而且必須在第一句之前（否則第一輪就跑錯）。
+		payloadForFetch = {
+			...DEMO_PAYLOAD,
+			sessions: [{ id: "s-next", chain: "本地部署測試", model: { provider: "rapid-mlx-worker", model: "qwen3.5-35b-4bit" } }],
+		};
+		nextPromptForFetch = "先讀交接單\n鏈=本地部署測試";
+		timeline.length = 0;
+		const beforeSelect = selectModelCalls.length;
+		const modelBody = body(hardValues2);
+		await settle(modelBody);
+		await created.find((node) => node.props?.["data-handoff-start"] !== undefined)?.props?.onClick?.();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		await settle(modelBody);
+		const selection = selectModelCalls.slice(beforeSelect).pop();
+		check(
+			selection?.sessionId === "s-new" && selection?.provider === "rapid-mlx-worker" && selection?.model === "qwen3.5-35b-4bit",
+			"新對話先選上這一場的模型（rapid-mlx-worker／qwen3.5-35b-4bit）",
+			JSON.stringify(selection),
+		);
+		const order = timeline.filter((entry) => entry.sessionId === "s-new").map((entry) => entry.kind);
+		check(order[0] === "selectModel" && order[1] === "prompt", "先選模型、再送第一句（順序不能顛倒）", order.join("→"));
+
+		// 沒有模型資料時不亂呼叫（維持原本行為：吃部署預設）。
+		payloadForFetch = { ...DEMO_PAYLOAD, sessions: [{ id: "s-next", chain: "本地部署測試" }] };
+		nextPromptForFetch = "先讀交接單\n鏈=本地部署測試";
+		const beforeSelect2 = selectModelCalls.length;
+		const noModelBody = body(hardValues2);
+		await settle(noModelBody);
+		await created.find((node) => node.props?.["data-handoff-start"] !== undefined)?.props?.onClick?.();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		await settle(noModelBody);
+		check(selectModelCalls.length === beforeSelect2, "沒有模型資料就不呼叫 selectModel（不會亂換模型）");
 
 		// 反向：未標記的場次（chain: null）不能被硬塞鏈 —— 沿用原本的「讓 AI 判斷」。
 		payloadForFetch = { ...DEMO_PAYLOAD, sessions: [{ id: "s-next", chain: null, chains: [] }] };

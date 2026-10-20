@@ -179,6 +179,36 @@ function titleOf(events) {
 }
 
 /**
+ * 這一場最後選用的模型：`model/selection` 事件優先，沒有才退回最後一筆 `request/header`。
+ *
+ * 為什麼要它（2026-10-20 使用者回報）：自動交接開的新對話吃的是**部署預設模型**
+ * （desktop profile 的 `agent-default-model`＝雲端 `deepseek-flash`），所以用本地模型的人
+ * 一交接就變成雲端。新對話要沿用這一場的模型，面板就得先讀得到它 —— 模型選擇是
+ * 「最後一筆為準」，與標題同一個道理。
+ * @param events - `readEvents()` 的結果
+ * @returns `{provider: string, model: string, reasoningEffort?: string}` 或 null
+ */
+export function modelOf(events) {
+	/** 只收形狀完整的選擇；缺欄位或空字串一律當作沒有。 */
+	const pick = (value) => {
+		if (typeof value?.provider !== "string" || value.provider === "") return null;
+		if (typeof value?.model !== "string" || value.model === "") return null;
+		return {
+			provider: value.provider,
+			model: value.model,
+			...(typeof value.reasoningEffort === "string" && value.reasoningEffort !== "" ? { reasoningEffort: value.reasoningEffort } : {}),
+		};
+	};
+	let chosen = null;
+	let header = null;
+	for (const event of events) {
+		if (event?.type === "model/selection") chosen = pick(event.data) ?? chosen;
+		else if (event?.type === "request/header") header = pick(event?.data?.header?.config ?? event?.data?.config) ?? header;
+	}
+	return chosen ?? header;
+}
+
+/**
  * 抽出「鏈」代號：**交接的最強證據就是新對話的第一句話**。
  *
  * 判定順序（前者較可信）：
@@ -390,6 +420,8 @@ export function readSessions(sessionsRoot, options = {}) {
 					// 目前標題（最後一筆 session/title）——自動編號只寫差異要靠它。
 					title,
 					titleSource,
+					// 這一場最後用的模型（交接時要沿用；新對話預設會吃部署的雲端模型）。
+					model: modelOf(events),
 					subagent,
 					startedAt: Number.isFinite(first.timeMs) ? first.timeMs : stat.mtimeMs,
 					// 最後活動時間（排序「最後」用；沒有事件時間就退回 startedAt）。

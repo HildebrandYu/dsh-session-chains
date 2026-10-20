@@ -108,8 +108,14 @@ node scripts/install.mjs --remove --apply   # 整包移除
 
 **交接會沿用這一場的模型**（2026-10-20 修）：新對話一律先吃部署預設（例如雲端），所以
 面板在建立新對話後、送出第一句**之前**，會把這一場最後選用的模型（日誌裡的
-`model/selection`，沒有就退回最後一次請求的設定）選給新對話。用本地模型的人交接後不會
-突然變成雲端；代價是選模型這個動作本身會順手把部署預設也改成它（DSH 內建行為）。
+`model/selection`，沒有就退回最後一次請求的設定）選給新對話。
+
+怎麼選：**走宿主路由** `POST /local/session-chains.select-model`（宿主直接呼叫
+`sessionController.selectModel`，與 UI 的模型選單同一個方法），成功失敗都回得出原因；
+舊宿主沒有這條路時才退回瀏覽器的 `ctx.remote.session.selectModel`。
+
+> 面板標題旁會顯示 `v0.1.7`。改了外掛之後如果數字沒變，就是**頁面還跑舊的 bundle**——
+> 按一次重新整理（Cmd+R）再試。
 
 ## 測試
 

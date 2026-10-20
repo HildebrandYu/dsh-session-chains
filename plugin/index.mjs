@@ -42,6 +42,16 @@ export const TITLES_PATH = "/local/session-chains.titles";
 /** 接續提示詞檔案（AI 在交接時寫入；面板的「交接→新對話」讀它）。 */
 export const NEXT_PROMPT_PATH = "/local/session-chains.next-prompt";
 
+/**
+ * 選模型路由（POST `{sessionId, provider, model, reasoningEffort?}`）。
+ *
+ * 為什麼要走宿主（2026-10-20 第二次修）：新對話預設吃部署的雲端模型，交接要把它改成
+ * 這一場的模型。瀏覽器端只能透過 `ctx.remote.session.selectModel`，但外掛 ctx 不一定有
+ * remote，而且失敗是靜音的 —— 使用者只會看到「又跳回雲端」。宿主這裡直接呼叫
+ * `sessionController.selectModel`（同一個 in-process 方法），成功失敗都回得出原因。
+ */
+export const SELECT_MODEL_PATH = "/local/session-chains.select-model";
+
 /** 專案根目錄＝本檔的上一層（`plugin/index.mjs` → 專案根）。 */
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -56,6 +66,20 @@ const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), ".dsh");
 const INSTALLED = PROJECT_ROOT.split(sep).includes("node_modules");
 const STATE_ROOT = process.env.SESSION_CHAINS_HOME ?? (INSTALLED ? join(DSH_HOME, "session-chains") : PROJECT_ROOT);
+
+/**
+ * 版本號：面板標題旁會顯示 `v0.1.7`。
+ * 存在的理由很實際 —— 改了瀏覽器端之後，最常見的失敗是「頁面還跑舊的 bundle」，
+ * 有這一行就一眼看得出來（不必猜是不是程式沒生效）。
+ */
+function packageVersion() {
+	try {
+		const manifest = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"));
+		return typeof manifest?.version === "string" ? manifest.version : "";
+	} catch {
+		return "";
+	}
+}
 
 /** 對照表預設路徑（改名寫在這裡；放在 `.state/`，不碰工作區其他檔案）。 */
 export const DEFAULT_ALIASES_FILE = join(STATE_ROOT, ".state", "aliases.json");
@@ -219,6 +243,62 @@ export function visibleSessions(sessions) {
 }
 
 /**
+ * 選模型路由：把某一場的模型選擇套到新開的對話（交接用）。
+ *
+ * 宿主直接呼叫 `sessionController.selectModel` —— 與 UI 的模型選單同一個方法，
+ * 但不必經過瀏覽器的 Remote 命名空間。任何一步失敗都回 {ok:false,error}，
+ * 前端才有東西可以顯示（舊版是靜音失敗，使用者只看到「又變回雲端」）。
+ * @param {{getController?: Function}} [options] - 依賴注入（測試用得到）
+ * @returns 處理函式 `(req, res) => void`
+ */
+export function createSelectModelHandler({ getController = () => null } = {}) {
+	return async (req, res) => {
+		applyCors(req, res);
+		try {
+			const method = String(req?.method ?? "GET").toUpperCase();
+			if (method === "OPTIONS") {
+				try {
+					res.setHeader("access-control-allow-methods", "POST, OPTIONS");
+					res.setHeader("access-control-allow-headers", "content-type");
+				} catch {
+					/* 不能設標頭就算了 */
+				}
+				sendJson(res, 204, {});
+				return;
+			}
+			if (method !== "POST") {
+				sendJson(res, 405, { ok: false, error: "method not allowed" });
+				return;
+			}
+			const body = await readJsonPost(req, res);
+			if (!body.ok) return;
+			const request = body.value ?? {};
+			const sessionId = typeof request.sessionId === "string" ? request.sessionId : "";
+			const provider = typeof request.provider === "string" ? request.provider : "";
+			const model = typeof request.model === "string" ? request.model : "";
+			if (sessionId === "" || provider === "" || model === "") {
+				sendJson(res, 400, { ok: false, error: "sessionId/provider/model required" });
+				return;
+			}
+			const controller = getController();
+			if (typeof controller?.selectModel !== "function") {
+				sendJson(res, 503, { ok: false, error: "session controller unavailable" });
+				return;
+			}
+			const value = await controller.selectModel({
+				sessionId,
+				provider,
+				model,
+				...(typeof request.reasoningEffort === "string" && request.reasoningEffort !== "" ? { reasoningEffort: request.reasoningEffort } : {}),
+			});
+			sendJson(res, 200, { ok: true, selected: value?.selected ?? null });
+		} catch (error) {
+			sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+		}
+	};
+}
+
+/**
  * 接續提示詞路由：GET 讀 `.state/next-prompt.txt`、POST `{clear:true}` 用完就刪。
  *
  * 為什麼要這條路：AI 在交接時寫好提示詞檔案，面板的「交接→新對話」才有東西可以貼。
@@ -304,6 +384,7 @@ export function createHandler({
 				generatedAt: Date.now(),
 				sessionsRoot,
 				files,
+				version: packageVersion(),
 				aliases: store.aliases,
 				sessionChains: store.sessionChains,
 				titles: store.titles,
@@ -347,6 +428,7 @@ function buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto = 10 
 	return {
 		ok: true,
 		generatedAt: Date.now(),
+		version: packageVersion(),
 		files,
 		aliases: store.aliases,
 		sessionChains: store.sessionChains,
@@ -665,6 +747,11 @@ export function apply(ctx, config) {
 				webCtx.effect(
 					() => webCtx.webServer.register({ kind: "exact", path: NEXT_PROMPT_PATH, handler: nextPromptHandler }),
 					"session-chains: 接續提示詞路由",
+				);
+				const selectModelHandler = createSelectModelHandler({ getController: () => webCtx.get("sessionController") });
+				webCtx.effect(
+					() => webCtx.webServer.register({ kind: "exact", path: SELECT_MODEL_PATH, handler: selectModelHandler }),
+					"session-chains: 選模型路由",
 				);
 				ctx.logger?.info?.(
 					`[session-chains] 已載入：GET ${ROUTE_PATH}／${USAGE_PATH}、POST ${RENAME_PATH}／${ASSIGN_PATH}；store ${DEFAULT_ALIASES_FILE}`,

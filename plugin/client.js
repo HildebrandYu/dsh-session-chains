@@ -69,6 +69,12 @@ window.__ModuleLoader__.load({
 			return new URL("local/session-chains.next-prompt", base).href;
 		}
 
+		/** 選模型端點（把這一場的模型套到新對話；宿主直接呼叫 sessionController）。 */
+		function resolveSelectModelEndpoint() {
+			const base = globalThis.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI;
+			return new URL("local/session-chains.select-model", base).href;
+		}
+
 		/** 標題回報端點（套用編號後回報，宿主記原標題備份／還原清單）。 */
 		function resolveTitlesEndpoint() {
 			const base = globalThis.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI;
@@ -2641,15 +2647,32 @@ window.__ModuleLoader__.load({
 			 */
 			const applyModelSelection = async (sessionId, model) => {
 				if (typeof model?.provider !== "string" || typeof model?.model !== "string") return false;
+				const request = {
+					sessionId,
+					provider: model.provider,
+					model: model.model,
+					...(typeof model.reasoningEffort === "string" && model.reasoningEffort !== "" ? { reasoningEffort: model.reasoningEffort } : {}),
+				};
+				// 首選：宿主路由（in-process 呼叫 sessionController.selectModel）。
+				// 2026-10-20：瀏覽器端的 ctx.remote 在檔案掛載的外掛裡不一定拿得到，
+				// 而且失敗是靜音的 —— 這條路會把原因回給前端。
+				try {
+					const response = await fetch(resolveSelectModelEndpoint(), {
+						method: "POST",
+						headers: { "content-type": "application/json", accept: "application/json" },
+						body: JSON.stringify(request),
+					});
+					if (response.ok) {
+						const payload = await response.json().catch(() => ({}));
+						if (payload?.ok !== false) return true;
+					}
+				} catch {
+					/* 舊宿主沒有這條路由：退回 Remote */
+				}
 				const remote = sessionRemote();
 				if (typeof remote?.selectModel !== "function") return false;
 				try {
-					const result = await remote.selectModel({
-						sessionId,
-						provider: model.provider,
-						model: model.model,
-						...(typeof model.reasoningEffort === "string" && model.reasoningEffort !== "" ? { reasoningEffort: model.reasoningEffort } : {}),
-					});
+					const result = await remote.selectModel(request);
 					return result?.ok !== false;
 				} catch {
 					return false;
@@ -3026,6 +3049,15 @@ window.__ModuleLoader__.load({
 						// 面板標題**不畫點**：鏈標頭與場次列已經在同一畫面，
 						// 上面再亮一顆就是同一個任務的第三個燈（使用者回報）。
 						h("strong", { style: { fontSize: "13px" } }, "交接鏈"),
+						// 版本徽章（2026-10-20）：改了瀏覽器端之後，最常見的失敗是「頁面還跑舊的 bundle」。
+						// 這一顆讓「有沒有載到新版」一眼看得出來（宿主把 package.json 的版本放進 payload）。
+						typeof data?.version === "string" && data.version !== ""
+							? h(
+									"span",
+									{ "data-sc-version": data.version, style: { color: "var(--dsw-alias-label-tertiary)", fontSize: "10px", opacity: 0.75 } },
+									`v${data.version}`,
+								)
+							: null,
 						// 更新狀態：重抓有沒有作用要**看得出來**（第一次做成沒有回饋，使用者以為按鍵壞了）。
 						h(
 							"span",

@@ -221,6 +221,19 @@ const sandbox = {
 			}
 			return { ok: true, status: 200, json: async () => ({ ok: true, prompt: nextPromptForFetch }) };
 		}
+		// 選模型路由（2026-10-20 第二版）：宿主直接呼叫 sessionController.selectModel。
+		if (String(url).includes("session-chains.select-model")) {
+			let request = {};
+			try {
+				request = JSON.parse(init?.body ?? "{}");
+			} catch {
+				/* 忽略 */
+			}
+			if (selectModelRouteStatus !== 200) return { ok: false, status: selectModelRouteStatus, json: async () => ({ ok: false, error: "route down" }) };
+			selectModelCalls.push(request);
+			timeline.push({ kind: "selectModel", sessionId: request?.sessionId });
+			return { ok: true, status: 200, json: async () => ({ ok: true }) };
+		}
 		return { ok: true, status: 200, json: async () => payloadForFetch };
 	},
 	// 面板會開輪詢與「抓取中…至少 400ms」的 timer；unref 掉，免得測試跑完還掛著。
@@ -282,11 +295,14 @@ const createCalls = [];
 const promptCalls = [];
 /** 交接時「把這一場的模型選給新對話」的呼叫（2026-10-20）。 */
 const selectModelCalls = [];
+/** 選模型路由的回應狀態（測 fallback：非 200 時要走 Remote）。 */
+let selectModelRouteStatus = 200;
 /** 呼叫順序的時間軸（驗「先選模型、再送第一句」）。 */
 const timeline = [];
+const remoteSelectCalls = [];
 const fakeRemoteSession = {
 	selectModel: async (request) => {
-		selectModelCalls.push(request);
+		remoteSelectCalls.push(request);
 		timeline.push({ kind: "selectModel", sessionId: request?.sessionId });
 		return { ok: true };
 	},
@@ -1471,6 +1487,7 @@ function containerCount(foot) {
 			"新對話先選上這一場的模型（rapid-mlx-worker／qwen3.5-35b-4bit）",
 			JSON.stringify(selection),
 		);
+		check(remoteSelectCalls.filter((call) => call?.sessionId === "s-new").length === 0, "首選走宿主路由（不必靠瀏覽器端的 remote）");
 		const order = timeline.filter((entry) => entry.sessionId === "s-new").map((entry) => entry.kind);
 		check(order[0] === "selectModel" && order[1] === "prompt", "先選模型、再送第一句（順序不能顛倒）", order.join("→"));
 
@@ -1484,6 +1501,27 @@ function containerCount(foot) {
 		await new Promise((resolve) => setTimeout(resolve, 60));
 		await settle(noModelBody);
 		check(selectModelCalls.length === beforeSelect2, "沒有模型資料就不呼叫 selectModel（不會亂換模型）");
+
+		// 宿主路由壞掉（舊版宿主／路由沒掛上）→ 退回 Remote，模型仍然選得到。
+		selectModelRouteStatus = 500;
+		payloadForFetch = {
+			...DEMO_PAYLOAD,
+			sessions: [{ id: "s-next", chain: "本地部署測試", model: { provider: "rapid-mlx", model: "qwen3.8-27b-4bit" } }],
+		};
+		nextPromptForFetch = "先讀交接單\n鏈=本地部署測試";
+		const beforeFallback = remoteSelectCalls.length;
+		const fallbackBody = body(hardValues2);
+		await settle(fallbackBody);
+		await created.find((node) => node.props?.["data-handoff-start"] !== undefined)?.props?.onClick?.();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		await settle(fallbackBody);
+		const viaRemote = remoteSelectCalls.slice(beforeFallback).pop();
+		check(
+			viaRemote?.sessionId === "s-new" && viaRemote?.provider === "rapid-mlx" && viaRemote?.model === "qwen3.8-27b-4bit",
+			"宿主路由壞掉時退回 Remote（模型還是選得到）",
+			JSON.stringify(viaRemote),
+		);
+		selectModelRouteStatus = 200;
 
 		// 反向：未標記的場次（chain: null）不能被硬塞鏈 —— 沿用原本的「讓 AI 判斷」。
 		payloadForFetch = { ...DEMO_PAYLOAD, sessions: [{ id: "s-next", chain: null, chains: [] }] };
@@ -2326,6 +2364,25 @@ console.log("");
 		"沒有交接詞時顯示原因（不是靜默失敗）",
 	);
 	nextPromptForFetch = "先讀交接單\n鏈=dsh-demo";
+}
+
+
+// ── 2026-10-20：面板要顯示版本（判斷「頁面是不是還跑舊 bundle」）──────────
+{
+	payloadForFetch = { ...DEMO_PAYLOAD, version: "9.9.9" };
+	if ((await settle(panel.component)) === null) {
+		(await settle(footer.component))?.props?.onClick?.();
+		await settle(panel.component);
+	}
+	// 面板吃的是 useChains 的快取：換 payload 之後要按「重抓」才會重新拉。
+	const reloadButton = () => created.find((node) => node.type === "button" && ["重抓", "✓ 已更新"].includes(String(node.children?.[0] ?? "")));
+	reloadButton()?.props?.onClick?.();
+	await new Promise((resolve) => setTimeout(resolve, 450));
+	await settle(panel.component);
+	const badge = created.find((node) => node.props?.["data-sc-version"] !== undefined);
+	check(badge !== undefined && String(badge.children?.[0] ?? "") === "v9.9.9", "面板標題旁顯示版本（v9.9.9）", String(badge?.children?.[0] ?? ""));
+	payloadForFetch = DEMO_PAYLOAD;
+	created.find((node) => node.props?.["data-session-chains-toggle"] !== undefined);
 }
 
 if (failed === 0) {

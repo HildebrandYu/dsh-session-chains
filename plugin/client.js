@@ -2592,6 +2592,30 @@ window.__ModuleLoader__.load({
 			}
 
 			/**
+			 * 目前這一場所屬的鏈（讀 `/local/session-chains` 的 `sessions[].chain`）。
+			 *
+			 * 為什麼要問後端而不是自己從第一句話解析：使用者可以在面板上**歸鏈／改名**，
+			 * 那才是他心裡的那條鏈；第一句話的 `鏈=` 可能早就是舊代號。
+			 * 2026-10-20 使用者回報「自動交接會亂跳」＝指令沒帶鏈，AI 沿用舊代號，
+			 * `canonicalOf` 再把它併進另一條鏈（本地部署測試004 → 模擬聲音工程）。
+			 * @param {string|null} sessionId - 目前這一場
+			 * @returns 鏈名或 null（未標記／讀不到）
+			 */
+			const resolveCurrentChain = async (sessionId) => {
+				if (typeof sessionId !== "string" || sessionId === "") return null;
+				try {
+					const response = await fetch(resolveEndpoint(), { headers: { accept: "application/json" } });
+					if (!response.ok) return null;
+					const data = await response.json().catch(() => null);
+					const list = Array.isArray(data?.sessions) ? data.sessions : [];
+					const entry = list.find((item) => item?.id === sessionId);
+					return typeof entry?.chain === "string" && entry.chain !== "" ? entry.chain : null;
+				} catch {
+					return null;
+				}
+			};
+
+			/**
 			 * 「交接→新對話」：讀 AI 寫好的接續提示詞，開一個新對話、把提示詞當第一個訊息送出，然後切過去。
 			 *
 			 * 為什麼不是一鍵全自動：提示詞只有**這一場的 AI**寫得出來（它才知道狀態與下一步）；
@@ -2622,6 +2646,17 @@ window.__ModuleLoader__.load({
 					const result = await reference.binding.session.prompt([{ type: "text", text: prompt }], "queue");
 					if (result?.ok !== true) throw new Error(result?.error?.message ?? "訊息送出失敗");
 				});
+				// 2026-10-20（使用者回報「自動交接會亂跳」）：交接詞裡的鏈代號是 AI 寫的，
+				// 可能還是舊代號（例：本地部署測試004 的 40-MediaProduction）→ `canonicalOf` 會把它
+				// 併到別條鏈。這一場在哪條鏈，新場次就歸回哪條鏈：直接寫一筆歸鏈，不靠 AI 寫對。
+				const sourceChain = await resolveCurrentChain(currentId);
+				if (sourceChain !== null) {
+					await fetch(resolveAssignEndpoint(), {
+						method: "POST",
+						headers: { "content-type": "application/json", accept: "application/json" },
+						body: JSON.stringify({ sessionId, chain: sourceChain }),
+					}).catch(() => {});
+				}
 				// 用過就清掉：避免下一次按到舊的交接詞。
 				await fetch(resolveNextPromptEndpoint(), {
 					method: "POST",
@@ -2651,8 +2686,11 @@ window.__ModuleLoader__.load({
 						/* 記不住就照送（頂多多一輪） */
 					}
 				}
+				// 2026-10-20：把「這一場在哪條鏈」直接寫進指令。留給 AI 自己猜會出事 ——
+				// 它會沿用第一句話的舊代號（或專案目錄名），`canonicalOf` 再併到別條鏈。
+				const chain = await resolveCurrentChain(sessionId);
 				await sessions.using(sessionId, { source: "workspaceOperation" }, async (reference) => {
-					const result = await reference.binding.session.prompt([{ type: "text", text: handoffPrompt() }], "queue");
+					const result = await reference.binding.session.prompt([{ type: "text", text: handoffPrompt({ chain }) }], "queue");
 					if (result?.ok !== true) throw new Error(result?.error?.message ?? "訊息送出失敗");
 				});
 				handoffPreparedSession = sessionId;

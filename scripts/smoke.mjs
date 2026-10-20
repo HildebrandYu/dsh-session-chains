@@ -1395,6 +1395,63 @@ function containerCount(foot) {
 	writeSettings({ autoHandoff: false });
 	store.delete("dsh.session-chains.auto-prepared:s-next");
 
+	// ── 2026-10-20 使用者回報「自動交接會亂跳」──────────────────────────────
+	// 例：本地部署測試004 一開始被丟到模擬聲音工程。原因是交接指令從沒帶上這一場的鏈，
+	// AI 只能沿用第一句話的舊代號（40-MediaProduction）或專案目錄名，canonicalOf 再把它併到別條鏈。
+	{
+		const chainPayload = {
+			...DEMO_PAYLOAD,
+			sessions: [{ id: "s-next", chain: "本地部署測試", chains: ["本地部署測試"], chainRaw: "40-MediaProduction", chainReason: "tag" }],
+		};
+		payloadForFetch = chainPayload;
+		writeSettings({ autoHandoff: false });
+		store.delete("dsh.session-chains.auto-prepared:s-next");
+		const before = promptCalls.length;
+		const freshBody = body(hardValues2);
+		await settle(freshBody);
+		created.find((node) => node.props?.["data-handoff-prepare"] !== undefined)?.props?.onClick?.();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		await settle(freshBody);
+		const instruction = promptCalls.slice(before).map((call) => String(call?.content?.[0]?.text ?? "")).join("\n");
+		check(!instruction.includes("鏈=<代號>"), "交接指令不再把「選哪條鏈」丟給 AI 猜");
+		check(
+			instruction.includes("鏈=本地部署測試"),
+			"交接指令寫的是這一場的鏈（鏈=本地部署測試，不是舊代號 40-MediaProduction）",
+			instruction.includes("鏈=40-MediaProduction") ? "仍是舊代號" : "",
+		);
+
+		// 就算 AI 還是寫了舊代號，新場次也要被歸回這一條鏈（不讓它跑去模擬聲音工程）。
+		nextPromptForFetch = "先讀交接單\n鏈=40-MediaProduction";
+		createCalls.length = 0;
+		const assignCalls = () => fetchCalls.filter((call) => call.url.includes("session-chains.assign"));
+		const assignsBefore = assignCalls().length;
+		const startBody = body(hardValues2);
+		await settle(startBody);
+		await created.find((node) => node.props?.["data-handoff-start"] !== undefined)?.props?.onClick?.();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		await settle(startBody);
+		const assignedBodies = assignCalls().slice(assignsBefore).map((call) => JSON.parse(call.init.body));
+		check(
+			assignedBodies.some((body) => body?.sessionId === "s-new" && body?.chain === "本地部署測試"),
+			"新開的場次被歸回這一條鏈（POST .assign 本地部署測試）",
+			JSON.stringify(assignedBodies),
+		);
+
+		// 反向：未標記的場次（chain: null）不能被硬塞鏈 —— 沿用原本的「讓 AI 判斷」。
+		payloadForFetch = { ...DEMO_PAYLOAD, sessions: [{ id: "s-next", chain: null, chains: [] }] };
+		nextPromptForFetch = "先讀交接單\n鏈=dsh-demo";
+		const beforeUnmarked = promptCalls.length;
+		const unmarkedBody = body(hardValues2);
+		await settle(unmarkedBody);
+		created.find((node) => node.props?.["data-handoff-prepare"] !== undefined)?.props?.onClick?.();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		await settle(unmarkedBody);
+		const unmarkedInstruction = promptCalls.slice(beforeUnmarked).map((call) => String(call?.content?.[0]?.text ?? "")).join("\n");
+		check(unmarkedInstruction.includes("鏈=<代號>"), "未標記的場次照舊：讓 AI 依專案目錄名判斷");
+		payloadForFetch = DEMO_PAYLOAD;
+		nextPromptForFetch = "先讀交接單\n鏈=dsh-demo";
+	}
+
 	// 收尾：回到預設，免得影響後面的檢查
 	writeSettings(DEFAULT_SETTINGS);
 	store.delete("dsh.session-chains.settings");

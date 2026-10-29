@@ -9,7 +9,8 @@
  *   - `webServer` 用巢狀 `ctx.inject` 取得；任何例外都必須在路由與 apply 內收斂。
  *   - 路由必須回 CORS 白名單標頭：頁面 origin 是 `dsh-app://app`，fetch 是跨來源。
  */
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +53,15 @@ export const NEXT_PROMPT_PATH = "/local/session-chains.next-prompt";
  */
 export const SELECT_MODEL_PATH = "/local/session-chains.select-model";
 
+/**
+ * 語音提示路由（POST `{text}`）。
+ *
+ * 為什麼走宿主：面板跑在瀏覽器裡，只能用系統語音（`speechSynthesis`），
+ * 但使用者要的是**自己的克隆聲線**，那只有宿主跑得動 `voice-say`。
+ * 這裡只負責把文字丟給 `say.sh`（detached、不等它唸完），失敗不影響面板。
+ */
+export const VOICE_PATH = "/local/session-chains.say";
+
 /** 專案根目錄＝本檔的上一層（`plugin/index.mjs` → 專案根）。 */
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -68,7 +78,7 @@ const INSTALLED = PROJECT_ROOT.split(sep).includes("node_modules");
 const STATE_ROOT = process.env.SESSION_CHAINS_HOME ?? (INSTALLED ? join(DSH_HOME, "session-chains") : PROJECT_ROOT);
 
 /**
- * 版本號：面板標題旁會顯示 `v0.1.7`。
+ * 版本號：面板標題旁會顯示 `v0.1.8`。
  * 存在的理由很實際 —— 改了瀏覽器端之後，最常見的失敗是「頁面還跑舊的 bundle」，
  * 有這一行就一眼看得出來（不必猜是不是程式沒生效）。
  */
@@ -373,31 +383,10 @@ export function createHandler({
 				return;
 			}
 			const store = loadStore(aliasesFile);
-			const { sessions, files } = readSessions(sessionsRoot, {
-				cache,
-				workspaceSlug: workspaceSlug !== "" ? workspaceSlug : null,
-			});
-			const mapped = visibleSessions(applyAssignments(applyAliases(sessions, store.aliases), store.sessionChains, store.aliases));
-			const chains = groupByChain(mapped);
-			sendJson(res, 200, {
-				ok: true,
-				generatedAt: Date.now(),
-				sessionsRoot,
-				files,
-				version: packageVersion(),
-				aliases: store.aliases,
-				sessionChains: store.sessionChains,
-				titles: store.titles,
-				// 置頂／封存：跟 buildPayload 一樣用 canonical 名回傳（改名後仍然生效）。
-				// 2026-10-19 修：GET 這支是卡片與面板真正吃的資料，之前只改了 POST 那支，
-				// 所以按了置頂「後端有存、前端永遠收不到」，畫面看起來就是按不動。
-				pinned: (Array.isArray(store.pinned) ? store.pinned : []).map((name) => canonicalOf(name, store.aliases)),
-				archived: (Array.isArray(store.archived) ? store.archived : []).map((name) => canonicalOf(name, store.aliases)),
-				sessions: mapped,
-				chains,
-				suggestions: suggestFor(chains),
-				numbering: planTitleSync({ chains, titles: store.titles, maxAuto }),
-			});
+			// 與所有寫入路由共用同一份形狀。`sessionsRoot` 是讀取路由才有的診斷欄位。
+			// 2026-10-29 修：這裡以前自己組一份（與 buildPayload 重複），只改了 POST 那支
+			// 就出現「置頂按不動」；現在形狀只有 payloadOf 一處可改。
+			sendJson(res, 200, payloadOf({ store, sessionsRoot, workspaceSlug, cache, maxAuto, extra: { sessionsRoot } }));
 		} catch (error) {
 			sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
 		}
@@ -417,8 +406,23 @@ function suggestFor(chains) {
 	return suggestChains(unmarked?.sessions ?? []);
 }
 
-/** 讀 sessions、套用兩張表、分組 —— 三個寫入路由回應時都要附上最新結果。 */
-function buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto = 10 }) {
+/**
+ * 把一份具名清單（置頂／封存）收斂成「canonical 名、去重」。
+ *
+ * 為什麼需要：改名是**映射**，不是改寫資料。所以 store 裡可能同時躺著舊代號與新名稱
+ * （先置頂舊代號、後來改名 → 兩筆都留著），回應時逐筆映射就會出現兩個一模一樣的名字
+ * （2026-10-29 由 routes.test.mjs 抓到）。顯示與寫入都先過這裡，兩邊看到的永遠是同一份。
+ * @param list - store 裡的清單
+ * @param aliases - 對照表
+ * @returns 去重後的現用名稱（保留原順序以外不保證排序）
+ */
+function canonicalList(list, aliases) {
+	const names = (Array.isArray(list) ? list : []).map((name) => canonicalOf(name, aliases));
+	return [...new Set(names.filter((name) => typeof name === "string" && name !== ""))];
+}
+
+/** 讀 sessions、套用兩張表、分組 —— 讀取路由與所有寫入路由共用這一份回應形狀。 */
+function payloadOf({ store, sessionsRoot, workspaceSlug = "", cache, maxAuto = 10, extra = {} }) {
 	const { sessions, files } = readSessions(sessionsRoot, {
 		cache,
 		workspaceSlug: workspaceSlug !== "" ? workspaceSlug : null,
@@ -430,12 +434,14 @@ function buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto = 10 
 		generatedAt: Date.now(),
 		version: packageVersion(),
 		files,
+		// 讀取路由多帶 `sessionsRoot`（診斷用）；寫入路由不必，所以由呼叫端決定。
+		...extra,
 		aliases: store.aliases,
 		sessionChains: store.sessionChains,
 		titles: store.titles,
 		// 置頂／封存都用「canonical 名」回傳：使用者改過名之後，舊名字的置頂仍然生效。
-		pinned: (Array.isArray(store.pinned) ? store.pinned : []).map((name) => canonicalOf(name, store.aliases)),
-		archived: (Array.isArray(store.archived) ? store.archived : []).map((name) => canonicalOf(name, store.aliases)),
+		pinned: canonicalList(store.pinned, store.aliases),
+		archived: canonicalList(store.archived, store.aliases),
 		sessions: mapped,
 		chains,
 		suggestions: suggestFor(chains),
@@ -453,57 +459,72 @@ function writeRegistry(registryFile, store, chains) {
 }
 
 /**
+ * 寫入路由的**信封**（五條寫入路由共用這一段，2026-10-29 抽取）。
+ *
+ * 每一支寫入 handler 以前都自己重做同樣六步：CORS → 檢查 POST／JSON → 讀 body →
+ * 驗證 → `loadStore` → 手組 5 欄位的 store → `saveStore` → 檢查 `!saved.ok` →
+ * `buildPayload` → `writeRegistry` → 回應。抄漏其中一步**不會壞**，只會安靜地不一致
+ * （最常見是忘了寫 `鏈代號.md`，或錯誤碼各寫一套）。信封擁有全部六步，handler 只剩
+ * 「驗證輸入」與「算出新 store」兩件業務規則。
+ *
+ * @param {object} spec
+ * @param {(value: any, current: object) => {ok: true, next: any} | {ok: false, status?: number, error: string}} spec.parse
+ *       驗證請求 body；回 `{ok:true, next}`（`next` 給 apply 用的中間值）或錯誤（預設 400）。
+ * @param {(next: any, current: object) => object} spec.apply
+ *       回新的 store（不可就地改 `current`）。
+ * @param {number} [spec.limit] body 上限（預設 8KB；標題回報要更大）。
+ * @returns {(options: object) => (req, res) => Promise<void>} handler 工廠（與原本的工廠同一個呼叫形狀）
+ */
+function createWriteRoute({ parse, apply, limit = 8192 }) {
+	return function build({ sessionsRoot, workspaceSlug = "", cache = new Map(), aliasesFile = DEFAULT_ALIASES_FILE, registryFile = DEFAULT_REGISTRY_FILE, maxAuto = 10 }) {
+		return async (req, res) => {
+			applyCors(req, res);
+			try {
+				const body = await readJsonPost(req, res, limit);
+				if (!body.ok) return;
+				const current = loadStore(aliasesFile);
+				const parsed = parse(body.value, current);
+				if (!parsed?.ok) {
+					sendJson(res, parsed?.status ?? 400, { ok: false, error: parsed?.error ?? "invalid request" });
+					return;
+				}
+				const store = apply(parsed.next, current);
+				const saved = saveStore(aliasesFile, store);
+				if (!saved.ok) {
+					sendJson(res, 500, { ok: false, error: saved.error });
+					return;
+				}
+				const payload = payloadOf({ store, sessionsRoot, workspaceSlug, cache, maxAuto });
+				writeRegistry(registryFile, store, payload.chains);
+				sendJson(res, 200, payload);
+			} catch (error) {
+				sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+			}
+		};
+	};
+}
+
+/**
  * 造出改名路由 handler（寫入路徑之一）。
  *
  * 只做一件事：把 `from → to` 登錄進對照表，並重寫 `鏈代號.md`。
  * **不改任何 session log**（那是歷史），所以既有的鏈不會斷。
+ * 信封（POST／JSON／body／存檔／payload／寫 md）由 `createWriteRoute` 負責。
  * @param {{sessionsRoot: string, workspaceSlug?: string, cache?: Map, aliasesFile?: string, registryFile?: string}} options - 依賴注入
  * @returns 非同步處理函式 `(req, res) => Promise<void>`
  */
-export function createRenameHandler({
-	sessionsRoot,
-	workspaceSlug = "",
-	cache = new Map(),
-	aliasesFile = DEFAULT_ALIASES_FILE,
-	registryFile = DEFAULT_REGISTRY_FILE,
-	maxAuto = 10,
-}) {
-	return async (req, res) => {
-		applyCors(req, res);
-		try {
-			const body = await readJsonPost(req, res);
-			if (!body.ok) return;
-			const from = typeof body.value?.from === "string" ? body.value.from.trim() : "";
-			const to = normalizeName(body.value?.to);
-			if (from === "" || to === null) {
-				sendJson(res, 400, { ok: false, error: "需要 from，且 to 必須是 1–60 字、不含空白與 =" });
-				return;
-			}
-			if (from === to) {
-				sendJson(res, 400, { ok: false, error: "新名稱與舊代號相同" });
-				return;
-			}
-			const current = loadStore(aliasesFile);
-			const store = {
-				aliases: updateAliases(current.aliases, from, to),
-				sessionChains: current.sessionChains,
-				titles: current.titles,
-				pinned: current.pinned,
-				archived: current.archived,
-			};
-			const saved = saveStore(aliasesFile, store);
-			if (!saved.ok) {
-				sendJson(res, 500, { ok: false, error: saved.error });
-				return;
-			}
-			const payload = buildPayload({ sessionsRoot, workspaceSlug, cache, store });
-			writeRegistry(registryFile, store, payload.chains);
-			sendJson(res, 200, payload);
-		} catch (error) {
-			sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
-		}
-	};
-}
+export const createRenameHandler = createWriteRoute({
+	parse(value) {
+		const from = typeof value?.from === "string" ? value.from.trim() : "";
+		const to = normalizeName(value?.to);
+		if (from === "" || to === null) return { ok: false, error: "需要 from，且 to 必須是 1–60 字、不含空白與 =" };
+		if (from === to) return { ok: false, error: "新名稱與舊代號相同" };
+		return { ok: true, next: { from, to } };
+	},
+	apply({ from, to }, current) {
+		return { ...current, aliases: updateAliases(current.aliases, from, to) };
+	},
+});
 
 /**
  * 造出歸鏈路由 handler（寫入路徑之二）。
@@ -513,51 +534,27 @@ export function createRenameHandler({
  * @param {{sessionsRoot: string, workspaceSlug?: string, cache?: Map, aliasesFile?: string, registryFile?: string}} options - 依賴注入
  * @returns 非同步處理函式 `(req, res) => Promise<void>`
  */
-export function createAssignHandler({
-	sessionsRoot,
-	workspaceSlug = "",
-	cache = new Map(),
-	aliasesFile = DEFAULT_ALIASES_FILE,
-	registryFile = DEFAULT_REGISTRY_FILE,
-	maxAuto = 10,
-}) {
-	return async (req, res) => {
-		applyCors(req, res);
-		try {
-			const body = await readJsonPost(req, res);
-			if (!body.ok) return;
-			const sessionId = typeof body.value?.sessionId === "string" ? body.value.sessionId.trim() : "";
-			if (sessionId === "" || sessionId.length > 100 || /[\s]/u.test(sessionId)) {
-				sendJson(res, 400, { ok: false, error: "需要合法的 sessionId" });
-				return;
-			}
-			const raw = body.value?.chain;
-			// 先讀 store：名字要過對照表，才不會把舊代號存成一條影子鏈。
-			const current = loadStore(aliasesFile);
-			// 留白（或沒帶）＝取消指定；有值就必須是合法的鏈名。
-			const clear = raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "");
-			const chain = clear ? "" : canonicalOf(normalizeName(raw), current.aliases);
-			if (!clear && chain === null) {
-				sendJson(res, 400, { ok: false, error: "chain 必須是 1–60 字、不含空白與 =（留白＝取消指定）" });
-				return;
-			}
-			const sessionChains = { ...current.sessionChains };
-			if (clear) delete sessionChains[sessionId];
-			else sessionChains[sessionId] = chain;
-			const store = { aliases: current.aliases, sessionChains, titles: current.titles, pinned: current.pinned, archived: current.archived };
-			const saved = saveStore(aliasesFile, store);
-			if (!saved.ok) {
-				sendJson(res, 500, { ok: false, error: saved.error });
-				return;
-			}
-			const payload = buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto });
-			writeRegistry(registryFile, store, payload.chains);
-			sendJson(res, 200, payload);
-		} catch (error) {
-			sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+export const createAssignHandler = createWriteRoute({
+	parse(value, current) {
+		const sessionId = typeof value?.sessionId === "string" ? value.sessionId.trim() : "";
+		if (sessionId === "" || sessionId.length > 100 || /[\s]/u.test(sessionId)) {
+			return { ok: false, error: "需要合法的 sessionId" };
 		}
-	};
-}
+		const raw = value?.chain;
+		// 留白（或沒帶）＝取消指定；有值就必須是合法的鏈名。
+		const clear = raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "");
+		// 名字要過對照表，才不會把舊代號存成一條影子鏈。
+		const chain = clear ? "" : canonicalOf(normalizeName(raw), current.aliases);
+		if (!clear && chain === null) return { ok: false, error: "chain 必須是 1–60 字、不含空白與 =（留白＝取消指定）" };
+		return { ok: true, next: { sessionId, clear, chain } };
+	},
+	apply({ sessionId, clear, chain }, current) {
+		const sessionChains = { ...current.sessionChains };
+		if (clear) delete sessionChains[sessionId];
+		else sessionChains[sessionId] = chain;
+		return { ...current, sessionChains };
+	},
+});
 
 /**
  * 造出「置頂／封存」路由 handler（寫入路徑之四）。
@@ -571,43 +568,27 @@ export function createAssignHandler({
  * @returns {(options: object) => (req, res) => Promise<void>} handler 工廠
  */
 export function createFlagHandler({ kind }) {
-	return function build({ sessionsRoot, workspaceSlug = "", cache = new Map(), aliasesFile = DEFAULT_ALIASES_FILE, registryFile = DEFAULT_REGISTRY_FILE, maxAuto = 10 }) {
-		return async (req, res) => {
-			applyCors(req, res);
-			try {
-				const body = await readJsonPost(req, res);
-				if (!body.ok) return;
-				// 過 normalizeName：打錯字（含空白、`=`）要在這裡擋掉，
-				// 否則會安靜地釘到一條不存在的鏈，畫面看起來成功、實際沒生效。
-				const raw = normalizeName(body.value?.chain);
-				const on = body.value?.on === true;
-				if (raw === null) {
-					sendJson(res, 400, { ok: false, error: "需要 chain（1–60 字、不含空白與 =）" });
-					return;
-				}
-				const current = loadStore(aliasesFile);
-				// 先過對照表：用舊代號按的置頂，也要落在改名後的那條鏈上。
-				const chain = canonicalOf(raw, current.aliases);
-				const store = {
-					aliases: current.aliases,
-					sessionChains: current.sessionChains,
-					titles: current.titles,
-					pinned: kind === "pinned" ? toggleInList(current.pinned, chain, on) : current.pinned,
-					archived: kind === "archived" ? toggleInList(current.archived, chain, on) : current.archived,
-				};
-				const saved = saveStore(aliasesFile, store);
-				if (!saved.ok) {
-					sendJson(res, 500, { ok: false, error: saved.error });
-					return;
-				}
-				const payload = buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto });
-				writeRegistry(registryFile, store, payload.chains);
-				sendJson(res, 200, payload);
-			} catch (error) {
-				sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
-			}
-		};
-	};
+	return createWriteRoute({
+		parse(value, current) {
+			// 過 normalizeName：打錯字（含空白、`=`）要在這裡擋掉，
+			// 否則會安靜地釘到一條不存在的鏈，畫面看起來成功、實際沒生效。
+			const raw = normalizeName(value?.chain);
+			if (raw === null) return { ok: false, error: "需要 chain（1–60 字、不含空白與 =）" };
+			// 先過對照表：用舊代號按的置頂，也要落在改名後的那條鏈上。
+			return { ok: true, next: { chain: canonicalOf(raw, current.aliases), on: value?.on === true } };
+		},
+		apply({ chain, on }, current) {
+			// 先收斂成 canonical 名再去重：改名後 store 裡可能同時有舊代號與新名稱，
+			// 直接 toggle 會寫進第二筆指向同一條鏈的名字（2026-10-29 由測試抓到）。
+			const pinned = canonicalList(current.pinned, current.aliases);
+			const archived = canonicalList(current.archived, current.aliases);
+			return {
+				...current,
+				pinned: kind === "pinned" ? toggleInList(pinned, chain, on) : pinned,
+				archived: kind === "archived" ? toggleInList(archived, chain, on) : archived,
+			};
+		},
+	});
 }
 
 /**
@@ -622,57 +603,101 @@ export function createFlagHandler({ kind }) {
  *          aliasesFile?: string, maxAuto?: number}} options - 依賴注入
  * @returns 非同步處理函式 `(req, res) => Promise<void>`
  */
-export function createTitlesHandler({
-	sessionsRoot,
-	workspaceSlug = "",
-	cache = new Map(),
-	aliasesFile = DEFAULT_ALIASES_FILE,
-	registryFile = DEFAULT_REGISTRY_FILE,
-	maxAuto = 10,
-}) {
+export const createTitlesHandler = createWriteRoute({
+	// 一次回報最多 500 筆，每筆約 120 bytes → 8 KB 的通用上限只夠 ~68 筆。
+	limit: 64 * 1024,
+	parse(value) {
+		const applied = value?.applied;
+		if (!Array.isArray(applied) || applied.length > 500) return { ok: false, error: "需要 applied 陣列（上限 500 筆）" };
+		const entries = [];
+		for (const entry of applied) {
+			const sessionId = typeof entry?.sessionId === "string" ? entry.sessionId.trim() : "";
+			if (sessionId === "" || sessionId.length > 100 || /[\s]/u.test(sessionId)) {
+				return { ok: false, error: "applied 內需要合法的 sessionId" };
+			}
+			const to = typeof entry?.to === "string" ? entry.to : "";
+			if (to === "") return { ok: false, error: "applied 內需要 to" };
+			const from = typeof entry?.from === "string" ? entry.from : "";
+			entries.push({ sessionId, from, to });
+		}
+		return { ok: true, next: { entries } };
+	},
+	apply({ entries }, current) {
+		const titles = { ...current.titles };
+		for (const { sessionId, from, to } of entries) {
+			if (titles[sessionId] === to) {
+				// 還原成功 → 備份功成身退。
+				delete titles[sessionId];
+				continue;
+			}
+			if (titles[sessionId] === undefined && from !== "") titles[sessionId] = from;
+		}
+		return { ...current, titles };
+	},
+});
+
+/**
+ * 語音提示：把一句話交給 `voice-say` 唸出來（不阻塞、失敗靜音）。
+ * @param {{script?: string}} [options] - 可覆寫 say.sh 路徑（測試用）
+ * @returns HTTP handler
+ */
+export function createVoiceHandler({ script = process.env.VOICE_SAY_SCRIPT ?? join(DSH_HOME, "skills", "voice-say", "scripts", "say.sh") } = {}) {
 	return async (req, res) => {
 		applyCors(req, res);
 		try {
-			// 一次回報最多 500 筆，每筆約 120 bytes → 8 KB 的通用上限只夠 ~68 筆。
-			const body = await readJsonPost(req, res, 64 * 1024);
+			const body = await readJsonPost(req, res);
 			if (!body.ok) return;
-			const applied = body.value?.applied;
-			if (!Array.isArray(applied) || applied.length > 500) {
-				sendJson(res, 400, { ok: false, error: "需要 applied 陣列（上限 500 筆）" });
+			const text = typeof body.value?.text === "string" ? body.value.text.trim().slice(0, 200) : "";
+			if (text === "") {
+				sendJson(res, 400, { ok: false, error: "text required" });
 				return;
 			}
-			const current = loadStore(aliasesFile);
-			const titles = { ...current.titles };
-			for (const entry of applied) {
-				const sessionId = typeof entry?.sessionId === "string" ? entry.sessionId.trim() : "";
-				if (sessionId === "" || sessionId.length > 100 || /[\s]/u.test(sessionId)) {
-					sendJson(res, 400, { ok: false, error: "applied 內需要合法的 sessionId" });
-					return;
+			// 2026-10-24 使用者要求：交接提示**先用系統預設語音**（不改全域預設）。
+			// `engine:"say"` → `--engine say --voice auto`：auto 會走系統朗讀的偏好語音
+			// （實測 com.apple...Shufen_zh-TW_premium），起音比克隆快、也不必等 VoiceStudio。
+			// 沒帶 engine（或其他值）就維持原本行為＝`say.sh` 自己的 auto（有克隆就用克隆）。
+			const engine = body.value?.engine === "say" ? "say" : "auto";
+			const args = engine === "say" ? ["--engine", "say", "--voice", "auto", text] : [text];
+			try {
+				// GUI 程序的 PATH 可能只有 /usr/bin：明確補上 Homebrew 與系統路徑，
+				// 否則 say.sh 內的 python3／curl 找不到會靜默失敗。
+				const env = {
+					...process.env,
+					PATH: ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", process.env.PATH ?? ""]
+						.filter(Boolean)
+						.join(":"),
+					// 少了這兩個，子在最小環境下會把中文 argv 當成非 UTF-8（`say` 直接不唸）。
+					LANG: process.env.LANG ?? "zh_TW.UTF-8",
+					LC_ALL: process.env.LC_ALL ?? "zh_TW.UTF-8",
+				};
+				let logFd = null;
+				try {
+					logFd = openSync(join(STATE_ROOT, "voice-announce.log"), "a");
+				} catch {
+					logFd = null;
 				}
-				const to = typeof entry?.to === "string" ? entry.to : "";
-				const from = typeof entry?.from === "string" ? entry.from : "";
-				if (to === "") {
-					sendJson(res, 400, { ok: false, error: "applied 內需要 to" });
-					return;
+				try {
+					appendFileSync(join(STATE_ROOT, "voice-announce.log"), `${new Date().toISOString()} announce: ${text}${engine === "say" ? "（系統語音）" : ""}\n`);
+				} catch {
+					/* 記不了就算了 */
 				}
-				if (titles[sessionId] === to) {
-					// 還原成功 → 備份功成身退。
-					delete titles[sessionId];
-					continue;
-				}
-				if (titles[sessionId] === undefined && from !== "") titles[sessionId] = from;
+				const child = spawn(script, args, {
+					detached: true,
+					env,
+					stdio: logFd === null ? "ignore" : ["ignore", "ignore", logFd],
+				});
+				child.on("error", (error) => {
+					try {
+						appendFileSync(join(STATE_ROOT, "voice-announce.log"), `${new Date().toISOString()} spawn error: ${error?.message ?? error}\n`);
+					} catch {
+						/* 記不了就算了 */
+					}
+				});
+				child.unref();
+			} catch {
+				/* 唸不出來不影響面板 */
 			}
-			const store = { aliases: current.aliases, sessionChains: current.sessionChains, titles, pinned: current.pinned, archived: current.archived };
-			const saved = saveStore(aliasesFile, store);
-			if (!saved.ok) {
-				sendJson(res, 500, { ok: false, error: saved.error });
-				return;
-			}
-			// 順手把 `鏈代號.md` 的場次刷新：新的一場進鏈時（＝有標題要改）就是場次變動的時刻，
-			// 不在這裡重寫的話，那份表會停在「上次改名時」的數字（2026-10-18 實測：寫成 2 場、實際 3 場）。
-			const payload = buildPayload({ sessionsRoot, workspaceSlug, cache, store, maxAuto });
-			writeRegistry(registryFile, store, payload.chains);
-			sendJson(res, 200, payload);
+			sendJson(res, 200, { ok: true });
 		} catch (error) {
 			sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
 		}
@@ -747,6 +772,11 @@ export function apply(ctx, config) {
 				webCtx.effect(
 					() => webCtx.webServer.register({ kind: "exact", path: NEXT_PROMPT_PATH, handler: nextPromptHandler }),
 					"session-chains: 接續提示詞路由",
+				);
+				const voiceHandler = createVoiceHandler();
+				webCtx.effect(
+					() => webCtx.webServer.register({ kind: "exact", path: VOICE_PATH, handler: voiceHandler }),
+					"session-chains: 語音提示路由",
 				);
 				const selectModelHandler = createSelectModelHandler({ getController: () => webCtx.get("sessionController") });
 				webCtx.effect(

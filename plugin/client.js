@@ -100,6 +100,12 @@ window.__ModuleLoader__.load({
 			return new URL("local/session-chains.archive", base).href;
 		}
 
+		/** 語音提示端點（`{text}`）——由宿主呼叫 `voice-say`，用使用者自己的克隆聲線。 */
+		function resolveVoiceEndpoint() {
+			const base = globalThis.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI;
+			return new URL("local/session-chains.say", base).href;
+		}
+
 		/**
 		 * 送出「置頂／封存」（兩個端點同一個 body 形狀）。
 		 * @param chain - 鏈名（伺服器會再過一次對照表）
@@ -214,6 +220,117 @@ window.__ModuleLoader__.load({
 		 */
 		function readCurrentSessionId(workspace) {
 			return readCurrentSessionIdFromDom(globalThis.document) ?? readCurrentSessionIdFromService(workspace);
+		}
+
+		/**
+		 * 把一句話丟給宿主唸（失敗一律靜音）。`announceTurnEnd` 是唯一呼叫端。
+		 * @param text - 要唸的字
+		 * @returns Promise<void>
+		 */
+		async function postAnnouncement(text) {
+			await fetch(resolveVoiceEndpoint(), {
+				method: "POST",
+				headers: { "content-type": "application/json", accept: "application/json" },
+				// 2026-10-24 使用者要求：先以系統預設語音發音（`engine:"say"` → say.sh 的
+				// `--engine say --voice auto`）。關掉這個設定就回去用克隆聲線。
+				body: JSON.stringify({ text, engine: readSettings().announceSystemVoice === false ? "auto" : "say" }),
+			}).catch(() => {});
+		}
+
+		/** 接手提示只唸一次：哪幾場已經唸過（localStorage，陣列存 sessionId）。 */
+		const RECEIPT_ANNOUNCED_KEY = "dsh.session-chains.recipient-announced";
+
+		/**
+		 * 讀「已經唸過接手提示」的場次。
+		 * @returns {string[]} sessionId 陣列（壞值回空陣列，不會讓提示卡住）
+		 */
+		function readAnnouncedReceipts() {
+			try {
+				const raw = globalThis.localStorage?.getItem(RECEIPT_ANNOUNCED_KEY);
+				const parsed = raw === null || raw === undefined ? null : JSON.parse(raw);
+				return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string" && id !== "") : [];
+			} catch {
+				return [];
+			}
+		}
+
+		/**
+		 * 記下「這一場的接手提示已經唸過」。只留最近 200 筆（免得 localStorage 無限長大）。
+		 * @param sessionId - 這一場的 id
+		 */
+		function markAnnouncedReceipt(sessionId) {
+			try {
+				const next = readAnnouncedReceipts().filter((id) => id !== sessionId);
+				next.push(sessionId);
+				globalThis.localStorage?.setItem(RECEIPT_ANNOUNCED_KEY, JSON.stringify(next.slice(-200)));
+			} catch {
+				/* 記不住就下次重唸一次，不影響正確性 */
+			}
+		}
+
+		/**
+		 * 從面板 payload 判斷「這一場是接手來的嗎」——是就回那條鏈的名字。
+		 *
+		 * 為什麼不解析第一句話的 `鏈=`：面板給的 `firstLine` **只截前 200 字**，
+		 * 實測 2026-10-24 那一場的 `鏈=語音互動` 就落在 200 字之後（提示詞開頭先寫「先讀哪幾個檔」）。
+		 * 宿主解析的是**完整**第一句話（`chains.mjs` 的 `extractChain(first.text)`），
+		 * 所以這裡直接用它的結果：本場歸屬的 `chains`，加上「誰把棒子交進這條鏈」——
+		 * 某場的 `handoffTo`（自己交出去的鏈）等於這條鏈，那一場就是 donor。
+		 * @param payload - `GET /local/session-chains` 的回傳
+		 * @param sessionId - 本場 id
+		 * @returns 鏈名（多條以「、」併）或 null（不是接手場／讀不到）
+		 */
+		function receiptChainOf(payload, sessionId) {
+			const chains = Array.isArray(payload?.chains) ? payload.chains : [];
+			const all = chains.flatMap((chain) => (Array.isArray(chain?.sessions) ? chain.sessions : []));
+			const mine = all.find((session) => session?.id === sessionId) ?? null;
+			if (mine === null) return null;
+			const names = Array.isArray(mine.chains) && mine.chains.length > 0
+				? mine.chains
+				: (typeof mine.chain === "string" && mine.chain !== "" ? [mine.chain] : []);
+			if (names.length === 0) return null;
+			const donor = all.some((session) => session?.id !== sessionId && names.includes(session?.handoffTo));
+			return donor ? names.join("、") : null;
+		}
+
+		/**
+		 * 一輪結束時唸一句（依使用者的定義，2026-10-24 晚）。
+		 *
+		 *   - **完成工作**＝AI 回答結束 → 「<鏈>交接鏈已完成」（**每一輪**都唸）
+		 *   - **交接完成**＝開新對話、貼上交接提示詞、AI 回覆結束 → 「<鏈>交接鏈已接手」（接手場第一輪）
+		 *
+		 * 鏈名一律取面板的歸屬結果（`chains`），不解析第一句話的文字：`firstLine` 只截 200 字，
+		 * 提示詞裡的 `鏈=` 常在 200 字之後（實測 2026-10-24 那一場）。
+		 * 讀不到鏈名就**不唸**——不要唸出「本交接鏈」那種聽不出是誰的句子。
+		 * @param sessionId - 本場 id
+		 * @returns Promise<void>
+		 */
+		async function announceTurnEnd(sessionId) {
+			try {
+				if (readSettings().voiceAnnounce === false) return;
+				if (typeof sessionId !== "string" || sessionId === "") return;
+				const response = await fetch(resolveEndpoint(), { headers: { accept: "application/json" } });
+				if (!response.ok) return;
+				const payload = await response.json();
+				const all = (Array.isArray(payload?.chains) ? payload.chains : [])
+					.flatMap((chain) => (Array.isArray(chain?.sessions) ? chain.sessions : []));
+				const mine = all.find((session) => session?.id === sessionId) ?? null;
+				if (mine === null) return;
+				const names = Array.isArray(mine.chains) && mine.chains.length > 0
+					? mine.chains
+					: (typeof mine.chain === "string" && mine.chain !== "" ? [mine.chain] : []);
+				if (names.length === 0) return;
+				// 接手場的**第一輪**＝交接完成；之後每一輪都算完成工作。
+				const receipt = readAnnouncedReceipts().includes(sessionId) ? null : receiptChainOf(payload, sessionId);
+				if (receipt !== null) {
+					markAnnouncedReceipt(sessionId);
+					await postAnnouncement(`${receipt}交接鏈已接手`);
+					return;
+				}
+				await postAnnouncement(`${names.join("、")}交接鏈已完成`);
+			} catch {
+				/* 靜音失敗：語音是附加價值，不該讓面板出錯 */
+			}
 		}
 
 		/**
@@ -533,6 +650,12 @@ window.__ModuleLoader__.load({
 			// 2026-10-18 使用者指定：到達門檻、這一輪結束後**自動交接**——
 			// 生成交接詞 → 開新對話 → 貼上 → 送出 → 切過去（一個開關；預設開，可關）。
 			autoHandoff: true,
+			// 2026-10-24 使用者要求：交接完成／已交接時用語音提示（用自己的克隆聲線）。
+			// 2026-10-24 晚重新定義：**每一輪回答結束**（＝完成工作）唸「<鏈>交接鏈已完成」；
+			// 接手場的第一輪結束（＝交接完成）唸「<鏈>交接鏈已接手」。舊版綁硬門檻，幾乎不會響。
+			// 同日追加：**先用系統預設語音**（起音快、不必等 VoiceStudio），關掉就回克隆。
+			announceSystemVoice: true,
+			voiceAnnounce: true,
 		};
 
 		/** 排序鍵的合法值（讀到別的一律回預設）。 */
@@ -611,6 +734,68 @@ window.__ModuleLoader__.load({
 		function subscribeSettings(listener) {
 			SETTINGS_LISTENERS.add(listener);
 			return () => SETTINGS_LISTENERS.delete(listener);
+		}
+
+		/** 場次清單方向（每一條鏈各自記）：只存倒過來的鏈，沒存＝舊→新。 */
+		const CHAIN_ORDER_KEY = "dsh.session-chains.chain-order";
+
+		/**
+		 * 讀「哪幾條鏈的場次清單倒著排」。
+		 *
+		 * 為什麼每條鏈各自記（2026-10-20 使用者要求）：`交接鏈` 已經 11 場，
+		 * 每次要開最近的那一場都得滑到最下面 —— 要翻的只是那一條，不是全部。
+		 * 只認 `"desc"`，其他值一律當沒設定（壞值不會讓場次順序亂掉）。
+		 * @returns {Record<string, "desc">} 鏈名 → `"desc"`
+		 */
+		function readChainOrder() {
+			try {
+				const raw = globalThis.localStorage?.getItem(CHAIN_ORDER_KEY);
+				const parsed = raw === null || raw === undefined ? null : JSON.parse(raw);
+				if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+				const order = {};
+				for (const [name, direction] of Object.entries(parsed)) {
+					if (name !== "" && direction === "desc") order[name] = "desc";
+				}
+				return order;
+			} catch {
+				return {};
+			}
+		}
+
+		/**
+		 * 記住某一條鏈的場次方向；`"asc"` 就是把它忘掉（回到預設的舊→新）。
+		 *
+		 * 改完叫一次設定訂閱者：卡片不必等下一次輪詢就會重畫。
+		 * @param chainName - 鏈名（現用名稱；改名後舊名留著無害，頂多回預設方向）
+		 * @param direction - `"asc"`／`"desc"`
+		 */
+		function writeChainOrder(chainName, direction) {
+			const next = readChainOrder();
+			if (direction === "desc") next[chainName] = "desc";
+			else delete next[chainName];
+			try {
+				if (Object.keys(next).length === 0) globalThis.localStorage?.removeItem(CHAIN_ORDER_KEY);
+				else globalThis.localStorage?.setItem(CHAIN_ORDER_KEY, JSON.stringify(next));
+			} catch {
+				/* 記不住就算了（這一次仍然生效） */
+			}
+			for (const listener of SETTINGS_LISTENERS) {
+				try {
+					listener();
+				} catch {
+					/* 單一訂閱者壞掉不影響其他人 */
+				}
+			}
+		}
+
+		/**
+		 * 某一條鏈的場次方向。
+		 * @param chainName - 鏈名
+		 * @param order - `readChainOrder()` 的回傳
+		 * @returns `"asc"`／`"desc"`
+		 */
+		function chainOrderOf(chainName, order) {
+			return order?.[chainName] === "desc" ? "desc" : "asc";
 		}
 
 		/**
@@ -842,6 +1027,9 @@ window.__ModuleLoader__.load({
 			// 使用者實測回報：「訊息還在跳，你複製的已經是舊資訊了」——數字與狀態都還在變，
 			// 這時候叫人交接、或先把交接指示放進剪貼簿，都是拿一個下一秒就過期的畫面當依據。
 			const running = useSession((state) => state?.running === true || state?.busy === true) === true;
+			// 2026-10-24：音提示要說鏈名。DOM 不一定有選取列（剛開、或側欄收起），
+			// 所以先讀 session store 的 id，DOM 只當後備。
+			const liveSessionId = useSession((state) => state?.sessionId ?? null);
 			const [tick, setTick] = React.useState(0);
 			// 「開新對話」：進行中與失敗原因（沒有實作就不顯示這顆按鈕）。
 			const [starting, setStarting] = React.useState(false);
@@ -866,6 +1054,24 @@ window.__ModuleLoader__.load({
 			const deferredUntil = readHandoffDefer();
 			// 三個理由才顯示：真的超標、這一輪已經結束、沒有在延後期內。
 			const hidden = verdict.level === "ok" || running || deferredUntil > Date.now();
+
+			// 2026-10-24 晚（使用者定義）：**AI 回答結束**就算「完成工作」→ 每一輪結束唸
+			// 「<鏈>交接鏈已完成」；接手場（開新對話＋貼上交接提示詞）的**第一輪**結束才是
+			// 「交接完成」→ 唸「<鏈>交接鏈已接手」。舊版把「已完成」綁在硬門檻
+			//（200 次／320k／50%），一般長度的對話永遠到不了，等於不會響——
+			// 2026-10-24 的 `翻譯介面` 那一場就是這樣沒聲音（log 完全沒有它）。
+			// `sawRunning` 是邊緣偵測：只在「跑過一輪、然後停」時唸，重整或剛掛載不會搶先唸。
+			const sawRunning = React.useRef(false);
+			React.useEffect(() => {
+				if (running) {
+					sawRunning.current = true;
+					return;
+				}
+				if (sawRunning.current !== true) return;
+				sawRunning.current = false;
+				announceTurnEnd(liveSessionId);
+			}, [running, liveSessionId]);
+
 			// 有沒有交接詞可以先按？橫幅出現時問一次（AI 跑完、橫幅再出現時會再問）。
 			const [promptReady, setPromptReady] = React.useState(false);
 			// 門檻自動生成：只在 hard、這一輪已結束、設定有開、而且這一場還沒做過時送一次。
@@ -906,6 +1112,9 @@ window.__ModuleLoader__.load({
 				setStarting(true);
 				Promise.resolve()
 					.then(() => handoffStarter())
+					// 2026-10-24 晚：**不在這裡唸「已交接」**。使用者的定義是「交接完成＝開新對話、
+					// 貼上提示詞、AI 回覆結束」——那個時刻只有新對話那一場知道，
+					// 由它的第一輪結束唸「<鏈>交接鏈已接手」（見 `announceTurnEnd`）。
 					.catch((error) => setStartError(`自動開新對話失敗：${error?.message ?? error}`))
 					.finally(() => setStarting(false));
 				return undefined;
@@ -1043,6 +1252,7 @@ window.__ModuleLoader__.load({
 									setStartError("");
 									try {
 										await handoffStarter();
+										// 同上：交接完成的那一句由新對話第一輪結束唸，不在這裡搶先唸。
 									} catch (error) {
 										setStartError(`開不了新對話：${error?.message ?? error}`);
 									} finally {
@@ -1317,6 +1527,10 @@ window.__ModuleLoader__.load({
 				// 排序（2026-10-18）：卡片與面板共用同一份設定；任一處改，另一處立刻跟上。
 				const [settings, setSettings] = React.useState(readSettings);
 				React.useEffect(() => subscribeSettings(() => setSettings(readSettings())), []);
+				// 場次方向（2026-10-20 使用者要求）：每條鏈各自翻，記在 localStorage；
+				// 與設定共用同一份訂閱（改完立刻重畫，不必等下一輪輪詢）。
+				const [chainOrder, setChainOrder] = React.useState(readChainOrder);
+				React.useEffect(() => subscribeSettings(() => setChainOrder(readChainOrder())), []);
 				React.useEffect(() => numbering.subscribe(() => setState(numbering.get())), [numbering]);
 				React.useEffect(() => {
 					if (data !== null) numbering.run(data);
@@ -1587,6 +1801,33 @@ window.__ModuleLoader__.load({
 									h("span", { style: { width: "10px", opacity: 0.6 } }, expanded ? "▾" : "▸"),
 									h("span", { style: { flex: "1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, group.chain),
 									h("span", { style: { opacity: 0.6, fontSize: "10px" } }, `${group.count} 場`),
+									// 場次方向（2026-10-20 使用者要求）：鏈長了（`交接鏈` 已 11 場），
+									// 每次要開最近一場都得滑到最下面 —— 每條鏈自己一顆，按一下換方向。
+									// 放在鏈列而不是卡片標題列：翻的是「這一條」，不是所有鏈。
+									h(
+										"span",
+										{
+											"data-card-chain-order": group.chain,
+											"data-card-chain-order-dir": chainOrderOf(group.chain, chainOrder),
+											title:
+												chainOrderOf(group.chain, chainOrder) === "desc"
+													? "場次：新→舊（按一下改成舊→新）"
+													: "場次：舊→新（按一下改成新→舊）",
+											onClick: (event) => {
+												event.stopPropagation();
+												writeChainOrder(group.chain, chainOrderOf(group.chain, chainOrder) === "desc" ? "asc" : "desc");
+											},
+											style: {
+												cursor: "pointer",
+												flex: "0 0 auto",
+												fontSize: "10px",
+												// 倒過來＝非預設狀態，所以用亮度說現在是哪一種（窄側欄放不下文字）。
+												opacity: chainOrderOf(group.chain, chainOrder) === "desc" ? 0.95 : 0.4,
+												padding: "0 2px",
+											},
+										},
+										"⇅",
+									),
 									// 置頂（2026-10-19 使用者要求：直接在側欄按，不必進面板）。
 									h(
 										"span",
@@ -1687,7 +1928,11 @@ window.__ModuleLoader__.load({
 							);
 						}
 						if (!expanded) continue;
-						(group.sessions ?? []).forEach((session, index) => {
+						// 編號先照「時間順序」算好再排方向：倒過來只換顯示位置，號碼不會跟著換人
+						// （號碼就是標題上的 `鏈名-003`，換人會和標題對不起來）。
+						const listed = (group.sessions ?? []).map((session, index) => ({ session, ordinal: index + 1 }));
+						if (chainOrderOf(group.chain, chainOrder) === "desc") listed.reverse();
+						listed.forEach(({ session, ordinal }) => {
 							const isCurrent = session.id === current;
 							rows.push(
 								h(
@@ -1704,7 +1949,7 @@ window.__ModuleLoader__.load({
 									h(
 										"span",
 										{ "data-card-number": "", style: { fontVariantNumeric: "tabular-nums", opacity: 0.6, width: "26px" } },
-										String(index + 1).padStart(3, "0"),
+										String(ordinal).padStart(3, "0"),
 									),
 									h(
 										"span",
@@ -3458,6 +3703,8 @@ window.__ModuleLoader__.load({
 								"勾選",
 							),
 							toggleField("autoHandoff", "到達門檻自動交接：生成交接詞 → 開新對話並切過去（對話結束後）"),
+							toggleField("voiceAnnounce", "每一輪回答結束用語音提示（「<鏈>交接鏈已完成」；接手第一輪唸「已接手」）"),
+							toggleField("announceSystemVoice", "交接提示先用系統語音（關＝用克隆聲線 916345b9）"),
 							toggleField("showCardSummary", "卡片標題顯示「N 條鏈・M 場」"),
 							toggleField("foldWorkspace", "工作區可以收合（標題列那顆上下箭頭）"),
 							toggleField("showBalance", "HUD：餘額"),
@@ -4135,6 +4382,8 @@ window.__ModuleLoader__.load({
 		exports.handoffPrompt = handoffPrompt;
 		exports.handoffAnchor = handoffAnchor;
 		exports.readHandoffDefer = readHandoffDefer;
+		exports.receiptChainOf = receiptChainOf;
+		exports.readAnnouncedReceipts = readAnnouncedReceipts;
 		return module.exports;
 	},
 });

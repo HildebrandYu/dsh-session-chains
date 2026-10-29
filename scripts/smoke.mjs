@@ -760,6 +760,52 @@ created.find((node) => node.props?.["data-chain-row"] === "dsh-demo").props.onCl
 await settle(Card);
 check(created.filter((node) => node.props?.["data-card-session"] !== undefined).length === 0, "再點一次收合該鏈");
 
+// ── 2026-10-20 使用者要求：每條鏈自己可以把場次「倒過來排」（鏈長了不必滑到最下面）
+{
+	// dsh-demo 兩場：s-head 較舊＝001、s-next 較新＝002（預設舊→新）。
+	created.find((node) => node.props?.["data-chain-row"] === "dsh-demo").props.onClick();
+	await settle(Card);
+	const orderButton = created.find((node) => node.props?.["data-card-chain-order"] === "dsh-demo");
+	check(orderButton !== undefined, "鏈列右側有「⇅」（翻轉這一條的場次順序）");
+	check(orderButton?.props?.["data-card-chain-order-dir"] === "asc", "預設仍是舊→新（不改變原本行為）");
+	check(
+		created.find((node) => node.props?.["data-card-chain-order"] === "dsh-demo-2")?.props?.["data-card-chain-order-dir"] === "asc",
+		"翻的是「這一條」：另一條鏈不受影響",
+	);
+
+	orderButton.props.onClick({ stopPropagation: () => {} });
+	await settle(Card);
+	const reversed = created.filter((node) => node.props?.["data-card-session"] !== undefined).map((node) => node.props["data-card-session"]);
+	check(reversed.join(",") === "s-next,s-head", "按一下 → 最近的那一場跑到最上面", reversed.join(","));
+	// 號碼要跟著「場次」走、不是跟著位置跑：否則會和標題上的 `鏈名-002` 對不起來。
+	const pairs = created
+		.filter((node) => node.props?.["data-card-session"] !== undefined)
+		.map((node) => {
+			const number = node.children.find((child) => child?.props?.["data-card-number"] !== undefined);
+			return `${node.props["data-card-session"]}=${number?.children?.[0] ?? "?"}`;
+		});
+	check(pairs.join(",") === "s-next=002,s-head=001", "倒排不會重編號（號碼跟著場次）", pairs.join(","));
+	check(
+		JSON.parse(store.get("dsh.session-chains.chain-order") ?? "{}")["dsh-demo"] === "desc",
+		"倒排記在 localStorage（重新整理還在）",
+		String(store.get("dsh.session-chains.chain-order")),
+	);
+	check(
+		created.find((node) => node.props?.["data-card-chain-order"] === "dsh-demo")?.props?.["data-card-chain-order-dir"] === "desc",
+		"按鈕自己換成「新→舊」",
+	);
+
+	created.find((node) => node.props?.["data-card-chain-order"] === "dsh-demo").props.onClick({ stopPropagation: () => {} });
+	await settle(Card);
+	const restored = created.filter((node) => node.props?.["data-card-session"] !== undefined).map((node) => node.props["data-card-session"]);
+	check(restored.join(",") === "s-head,s-next", "再按一下 → 回到舊→新", restored.join(","));
+	check(store.get("dsh.session-chains.chain-order") === undefined, "回到預設就從 localStorage 移除（不留下垃圾）");
+
+	// 收合回去，後面的測試照原本的前提跑。
+	created.find((node) => node.props?.["data-chain-row"] === "dsh-demo").props.onClick();
+	await settle(Card);
+}
+
 // ── 2026-10-18：卡片上就地改名（使用者：改名只能再進去下一層，太麻煩）─────────
 {
 	// 先展開一條鏈：才好驗「改完名展開狀態跟著換名字」（否則鏈會突然收起來）。
@@ -2366,6 +2412,124 @@ console.log("");
 	nextPromptForFetch = "先讀交接單\n鏈=dsh-demo";
 }
 
+
+// ── 2026-10-24（晚）：每一輪回答結束都要唸；接手場第一輪唸「已接手」──────────
+// 使用者的定義：**完成工作＝AI 回答結束**（每一輪）→「<鏈>交接鏈已完成」；
+// **交接完成＝開新對話＋貼提示詞＋AI 回覆結束** →「<鏈>交接鏈已接手」。
+// 舊版把「已完成」綁在硬門檻（200 次／320k／50%）→ `翻譯介面` 那一場完全沒響。
+{
+	const receiptChainOf = sandbox.captured.exports.receiptChainOf;
+	const HandoffGuardBody = sandbox.captured.exports.HandoffGuardBody;
+	check(typeof receiptChainOf === "function", "匯出 receiptChainOf（接手判定）");
+
+	// ① 純函式：donor＝另一場把棒子交進這條鏈（`handoffTo` 等於鏈名）
+	const chainPayload = {
+		chains: [
+			{
+				chain: "voice",
+				sessions: [
+					{ id: "s-old", chain: "voice", chains: ["voice"], handoffTo: "voice" },
+					{ id: "s-new", chain: "voice", chains: ["voice"], handoffTo: null },
+				],
+			},
+			{ chain: "solo", sessions: [{ id: "s-solo", chain: "solo", chains: ["solo"], handoffTo: null }] },
+			{
+				chain: "voice2",
+				sessions: [
+					{ id: "s-old2", chain: "voice2", chains: ["voice2"], handoffTo: "voice2" },
+					{ id: "s-new2", chain: "voice2", chains: ["voice2"], handoffTo: null },
+				],
+			},
+			{ chain: null, sessions: [{ id: "s-loose2", chain: null, chains: [], handoffTo: null }] },
+		],
+	};
+	check(receiptChainOf(chainPayload, "s-new") === "voice", "有 donor → 認得出是接手場", String(receiptChainOf(chainPayload, "s-new")));
+	check(receiptChainOf(chainPayload, "s-solo") === null, "自己起鏈（沒有 donor）→ 不算接手");
+	check(receiptChainOf(chainPayload, "s-old") === null, "donor 自己不算接手場（它沒被別人交進來）");
+	check(receiptChainOf(chainPayload, "s-unknown") === null, "查不到這一場 → null");
+	check(receiptChainOf({}, "s-new") === null, "payload 壞掉 → null（不炸）");
+
+	// ② 接手場：第一輪結束唸「已接手」，同一場下一輪結束改唸「已完成」
+	store.set("dsh.session-chains.settings", JSON.stringify({ voiceAnnounce: true }));
+	payloadForFetch = chainPayload;
+	const sessionState = { current: { running: true, sessionId: "s-new" } };
+	const before = fetchCalls.length;
+	const receiptComponent = () =>
+		HandoffGuardBody({
+			useProjection: () => undefined,
+			useSession: (selector) => selector(sessionState.current),
+		});
+	const sayCalls = () => fetchCalls.slice(before).filter((call) => call.url.includes("session-chains.say"));
+	await settle(receiptComponent);
+	check(sayCalls().length === 0, "還在跑（running）→ 先不唸");
+	sessionState.current = { running: false, sessionId: "s-new" };
+	await settle(receiptComponent);
+	const says = sayCalls();
+	check(says.length === 1, "接手場第一輪跑完 → 唸一次", String(says.length));
+	check(String(says[0]?.init?.body ?? "").includes("voice交接鏈已接手"), "唸的是「<鏈>交接鏈已接手」", String(says[0]?.init?.body ?? ""));
+	check(String(says[0]?.init?.body ?? "").includes('"engine":"say"'), "預設用系統預設語音（engine=say）", String(says[0]?.init?.body ?? ""));
+	await settle(receiptComponent);
+	check(sayCalls().length === 1, "只是重畫不會重複唸（不是真的下一輪）");
+	// 真的下一輪：running true → false
+	sessionState.current = { running: true, sessionId: "s-new" };
+	await settle(receiptComponent);
+	sessionState.current = { running: false, sessionId: "s-new" };
+	await settle(receiptComponent);
+	const second = sayCalls();
+	check(second.length === 2, "同一場的下一輪結束 → 再唸一次", String(second.length));
+	check(String(second[1]?.init?.body ?? "").includes("voice交接鏈已完成"), "接手之後每一輪唸「<鏈>交接鏈已完成」", String(second[1]?.init?.body ?? ""));
+
+	// ②-2 關掉「先用系統語音」→ 回去用克隆（engine=auto）
+	store.set("dsh.session-chains.settings", JSON.stringify({ voiceAnnounce: true, announceSystemVoice: false }));
+	const cloneState = { current: { running: true, sessionId: "s-new2" } };
+	const beforeClone = fetchCalls.length;
+	const cloneComponent = () =>
+		HandoffGuardBody({
+			useProjection: () => undefined,
+			useSession: (selector) => selector(cloneState.current),
+		});
+	await settle(cloneComponent);
+	cloneState.current = { running: false, sessionId: "s-new2" };
+	await settle(cloneComponent);
+	const cloneSays = fetchCalls.slice(beforeClone).filter((call) => call.url.includes("session-chains.say"));
+	check(cloneSays.length === 1, "關掉系統語音 → 仍然會唸", String(cloneSays.length));
+	check(String(cloneSays[0]?.init?.body ?? "").includes('"engine":"auto"'), "關掉系統語音 → engine=auto（用克隆）", String(cloneSays[0]?.init?.body ?? ""));
+
+	// ③ 自己起鏈（不是接手場）→ 也要唸，但唸「已完成」
+	store.set("dsh.session-chains.settings", JSON.stringify({ voiceAnnounce: true }));
+	const soloState = { current: { running: true, sessionId: "s-solo" } };
+	const beforeSolo = fetchCalls.length;
+	const soloComponent = () =>
+		HandoffGuardBody({
+			useProjection: () => undefined,
+			useSession: (selector) => selector(soloState.current),
+		});
+	await settle(soloComponent);
+	soloState.current = { running: false, sessionId: "s-solo" };
+	await settle(soloComponent);
+	const soloSays = fetchCalls.slice(beforeSolo).filter((call) => call.url.includes("session-chains.say"));
+	check(soloSays.length === 1, "自己起鏈跑完 → 也會唸（完成工作）", String(soloSays.length));
+	check(String(soloSays[0]?.init?.body ?? "").includes("solo交接鏈已完成"), "唸「<鏈>交接鏈已完成」", String(soloSays[0]?.init?.body ?? ""));
+
+	// ④ 沒有鏈名（未標記）→ 不唸（不要唸出「本交接鏈」）
+	const looseState = { current: { running: true, sessionId: "s-loose2" } };
+	const beforeLoose = fetchCalls.length;
+	const looseComponent = () =>
+		HandoffGuardBody({
+			useProjection: () => undefined,
+			useSession: (selector) => selector(looseState.current),
+		});
+	await settle(looseComponent);
+	looseState.current = { running: false, sessionId: "s-loose2" };
+	await settle(looseComponent);
+	check(
+		fetchCalls.slice(beforeLoose).filter((call) => call.url.includes("session-chains.say")).length === 0,
+		"沒有鏈名 → 不唸（不要「本交接鏈」）",
+	);
+
+	store.delete("dsh.session-chains.recipient-announced");
+	payloadForFetch = DEMO_PAYLOAD;
+}
 
 // ── 2026-10-20：面板要顯示版本（判斷「頁面是不是還跑舊 bundle」）──────────
 {

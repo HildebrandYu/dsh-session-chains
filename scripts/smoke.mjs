@@ -1287,6 +1287,35 @@ function containerCount(foot) {
 	check(narrow?.width === 240, "太窄時寬度至少 240px（不會擠成一團）", String(narrow?.width));
 	check(handoffAnchor({ dock: null }) === null && handoffAnchor({}) === null, "量不到就回 null（元件用後備位置）");
 	check(handoffAnchor({ dock: { left: 0, width: 0, top: 10 } }) === null, "寬度 0 也算量不到");
+
+	// 2026-11-06：DSH 0.2.2 的 `.composerSeat` 有 `will-change: transform` → 它變成 fixed 的參照框。
+	// 提醒照「視窗座標」算、卻被當成「composer 座標」解讀，於是跑到右下角（使用者回報）。
+	const establishesFixedBlock = sandbox.captured.exports.establishesFixedBlock;
+	check(establishesFixedBlock({ "will-change": "transform" }) === true, "will-change: transform 就是一個 fixed 參照框（0.2.2 的成因）");
+	check(establishesFixedBlock({ willChange: "transform" }) === true, "駝峰寫法也認得");
+	check(establishesFixedBlock({ "will-change": "auto" }) === false, "will-change: auto 不算");
+	check(establishesFixedBlock({ transform: "matrix(1, 0, 0, 1, 0, 0)" }) === true, "transform 不是 none 就成立");
+	check(establishesFixedBlock({ transform: "none", filter: "blur(2px)" }) === true, "filter 也算");
+	check(establishesFixedBlock({ contain: "paint" }) === true, "contain: paint 也算");
+	check(establishesFixedBlock({ "container-type": "inline-size" }) === true, "container-type 也算");
+	check(establishesFixedBlock({}) === false && establishesFixedBlock(null) === false, "普通元素（或沒有樣式）不算");
+
+	// 有參照框時：座標要換算成「相對於參照框」，否則就會被 compose 的位置帶偏。
+	const inBlock = handoffAnchor({
+		dock: { left: 280, width: 800, top: 600 },
+		scroll: { top: 80 },
+		block: { left: 200, top: 600, width: 900 },
+	});
+	check(inBlock?.left === 480 && inBlock?.top === -512, "有參照框：扣掉它自己的左上角（視窗 680/88 → 區塊內 480/-512）", JSON.stringify(inBlock));
+	const noScroll = handoffAnchor({ dock: { left: 280, width: 800, top: 600 }, block: { left: 0, top: 0 } });
+	check(noScroll?.top === 608, "量不到訊息區 → 退回 dock.top（不亂跳）", String(noScroll?.top));
+
+	// 量不到 dock 時的後備位置也要換算：否則 top:64px 會變成「composer 裡往上 64px」＝畫面底部。
+	const fallbackAnchor = sandbox.captured.exports.fallbackAnchor;
+	const fallback = fallbackAnchor({ left: 200, top: 600, width: 900 });
+	check(fallback?.left === 450 && fallback?.top === -536, "後備位置：區塊中央、視窗上方 64px", JSON.stringify(fallback));
+	check(fallbackAnchor(null) === null, "沒有參照框就交回 CSS 的 50%／64px");
+
 	const numbers = created.find((node) => node.props?.["data-handoff-numbers"] !== undefined);
 	check(String(numbers?.children?.[0] ?? "").includes("330k") && String(numbers?.children?.[0] ?? "").includes("210"), "橫幅寫出本場 tokens／請求數", String(numbers?.children?.[0] ?? ""));
 

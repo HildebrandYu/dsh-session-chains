@@ -75,6 +75,16 @@ node scripts/install.mjs --remove --apply   # 整包移除
 3. **到門檻**：畫面會跳提醒（warn 可延後 30 分鐘、hard 只能延後 5 分鐘）。
    打開 ⚙ 的「到達門檻自動交接」，hard 會在這一輪結束後**自己**做完上面第 2 步。
 
+提醒浮在**對話欄正中央、訊息區最上面**（不是視窗正中央 —— 左邊有側欄）。這個位置是
+量出來的：`[data-composer-dock]` 給左右與寬度、`scrollBody` 給最上面，再換算成
+`position: fixed` 的參照框座標。
+
+> **2026-11-06 修（0.1.9）**：DSH 0.2.2 起，輸入框所在的 `.composerSeat` 為了毛玻璃加了
+> `will-change: transform` —— 而 `will-change` 會讓它**變成 fixed 子孫的包含區塊**。
+> 提醒明明照「視窗座標」算，卻被當成「composer 座標」解讀，於是掉到右下角。現在會往上找
+> 最近的參照框（`transform`／`filter`／`contain`／`container-type`／`will-change` 任一），
+> 把座標換算進去；量不到 dock 時的後備位置也一樣換算，不再假設「原點在左上角」。
+
 ## 門檻（預設值與怎麼選）
 
 | 訊號 | 提醒（warn） | 強制（hard） |
@@ -115,7 +125,7 @@ node scripts/install.mjs --remove --apply   # 整包移除
 `sessionController.selectModel`，與 UI 的模型選單同一個方法），成功失敗都回得出原因；
 舊宿主沒有這條路時才退回瀏覽器的 `ctx.remote.session.selectModel`。
 
-> 面板標題旁會顯示 `v0.1.8`。改了外掛之後如果數字沒變，就是**頁面還跑舊的 bundle**——
+> 面板標題旁會顯示 `v0.1.9`。改了外掛之後如果數字沒變，就是**頁面還跑舊的 bundle**——
 > 按一次重新整理（Cmd+R）再試。
 
 ## 語音提示（2026-10-24）

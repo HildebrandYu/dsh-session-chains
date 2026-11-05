@@ -955,24 +955,147 @@ window.__ModuleLoader__.load({
 		 * 對話欄並不是視窗的正中央 —— 上一版就是這樣被說「位置沒有貼齊」。
 		 * 這裡拿兩個**實際的**長方形來算：
 		 *   - `dock`：輸入框那一區（`[data-composer-dock]`）＝ 對話欄的寬度與左右位置；
-		 *   - `scroll`：訊息捲動區（`[class*="scrollBody"]`）＝ 對話框的最上面。
-		 * @param {{dock?: object, scroll?: object}} [input] - 兩個元素的 `getBoundingClientRect()`
+		 *   - `scroll`：訊息捲動區（`[class*="scrollBody"]`）＝ 對話框的最上面；
+		 *   - `block`：`position: fixed` 的**參照框**（見 `fixedBlockRect`）。
+		 *
+		 * 為什麼要多帶 `block`（2026-11-06 修）：DSH 0.2.2 起，docked composer 的
+		 * `.composerSeat` 加了 `will-change: transform`（為了毛玻璃），而 `will-change`
+		 * 會讓它成為 fixed 子孫的**包含區塊** —— 提醒明明是照「視窗座標」算的，卻被
+		 * 解讀成「composer 座標」，於是跑到右下角。這裡把座標換算成參照框的座標。
+		 * @param {{dock?: object, scroll?: object, block?: object}} [input] - 三個元素的 `getBoundingClientRect()`
 		 * @returns `{left, top, width}` 或 null（量不到就讓呼叫端用後備值）
 		 */
 		function handoffAnchor(input = {}) {
 			const dock = input?.dock;
 			const scroll = input?.scroll;
+			const block = input?.block;
 			if (dock === null || dock === undefined) return null;
 			if (!Number.isFinite(dock.left) || !Number.isFinite(dock.width) || dock.width <= 0) return null;
 			const left = dock.left + dock.width / 2;
 			const top = (scroll !== null && scroll !== undefined && Number.isFinite(scroll.top) ? scroll.top : dock.top) + 8;
 			if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+			// 有參照框就換算：fixed 的 left／top 是「相對於參照框」，不是相對於視窗。
+			const originLeft = Number.isFinite(block?.left) ? block.left : 0;
+			const originTop = Number.isFinite(block?.top) ? block.top : 0;
 			return {
-				left: Math.round(left),
-				top: Math.round(top),
+				left: Math.round(left - originLeft),
+				top: Math.round(top - originTop),
 				// 寬度跟輸入框一樣（再寬也不會超出），最小 240px 免得窄視窗擠成一團。
 				width: Math.max(240, Math.round(dock.width)),
 			};
+		}
+
+		/** 這是「量不到任何東西」時的位置：視窗正中央、上方 64px（相對於參照框時由呼叫端換算）。 */
+		const FALLBACK_TOP = 64;
+
+		/**
+		 * 量不到 `dock` 時的後備位置。**有參照框就一起換算**，否則 `top: 64px` 會變成
+		 * 「composer 裡往上 64px」（畫面底部），而不是視窗上方。
+		 * @param {object|null} block - 參照框的長方形（`fixedBlockRect` 的回傳）
+		 * @returns {{left: number, top: number, width: number}|null} 換算後的位置；沒有參照框時回 null（用 CSS 的 50%／64px）
+		 */
+		function fallbackAnchor(block) {
+			if (block === null || block === undefined) return null;
+			const width = Number.isFinite(block.width) && block.width > 0 ? Math.round(block.width) : 0;
+			if (width <= 0) return null;
+			if (!Number.isFinite(block.top)) return null;
+			return { left: Math.round(width / 2), top: Math.round(FALLBACK_TOP - block.top), width: Math.max(240, width) };
+		}
+
+		/** 從 style 物件（CSSStyleDeclaration 或普通物件）讀一個屬性。 */
+		function styleValue(style, name) {
+			if (style === null || style === undefined) return "";
+			try {
+				if (typeof style.getPropertyValue === "function") {
+					const direct = style.getPropertyValue(name);
+					if (typeof direct === "string" && direct !== "") return direct;
+				}
+			} catch {
+				/* 讀不到就退回下面的直接取值 */
+			}
+			const camel = name.replace(/-([a-z])/gu, (_, letter) => letter.toUpperCase());
+			const value = style[name] ?? style[camel];
+			return typeof value === "string" ? value : "";
+		}
+
+		/**
+		 * 這個元素的樣式會不會讓它成為 `position: fixed` 子孫的**包含區塊**。
+		 *
+		 * 依 CSS 規範，下列任一都會：`transform`／`translate`／`rotate`／`scale`、
+		 * `perspective`、`filter`、`backdrop-filter`、`contain: paint|layout|strict|content`、
+		 * `container-type`，以及**`will-change` 指名這幾個屬性**（DSH 0.2.2 的
+		 * `.composerSeat` 就是這樣中的）。
+		 * @param {object} style - 計算後的樣式
+		 * @returns {boolean} 是否為 fixed 的參照框
+		 */
+		function establishesFixedBlock(style) {
+			if (style === null || style === undefined) return false;
+			for (const name of ["transform", "translate", "rotate", "scale", "perspective", "filter", "backdrop-filter"]) {
+				const value = styleValue(style, name).trim();
+				if (value !== "" && value !== "none") return true;
+			}
+			const willChange = styleValue(style, "will-change").trim();
+			if (willChange !== "" && willChange !== "auto" && /(transform|translate|rotate|scale|filter|perspective|backdrop-filter)/u.test(willChange)) return true;
+			const contain = styleValue(style, "contain").trim();
+			if (contain !== "" && contain !== "none" && /(paint|layout|strict|content)/u.test(contain)) return true;
+			const containerType = styleValue(style, "container-type").trim();
+			if (containerType !== "" && containerType !== "normal") return true;
+			return false;
+		}
+
+		/**
+		 * 往上找**最近的** fixed 參照框，回傳它的 padding box（`left`／`top`／`width`）。
+		 *
+		 * 找不到（或瀏覽器不給 `getComputedStyle`）就回 null —— 呼叫端當作視窗座標處理。
+		 * @param {object} element - 提醒自己的節點（從它的父層開始找）
+		 * @returns {{left: number, top: number, width: number}|null} 參照框
+		 */
+		function fixedBlockRect(element) {
+			try {
+				const getStyle = globalThis.getComputedStyle;
+				if (typeof getStyle !== "function") return null;
+				let node = element?.parentElement ?? null;
+				for (let depth = 0; node !== null && node !== undefined && depth < 12; depth += 1, node = node.parentElement ?? null) {
+					const style = getStyle.call(globalThis, node);
+					if (!establishesFixedBlock(style)) continue;
+					const rect = node.getBoundingClientRect?.();
+					if (rect === null || rect === undefined) return null;
+					// fixed 的座標以 padding box 為準：扣掉邊框。
+					const borderLeft = Number.parseFloat(styleValue(style, "border-left-width")) || 0;
+					const borderTop = Number.parseFloat(styleValue(style, "border-top-width")) || 0;
+					return { left: rect.left + borderLeft, top: rect.top + borderTop, width: rect.width };
+				}
+			} catch {
+				/* 量不到就當作沒有參照框（視窗座標） */
+			}
+			return null;
+		}
+
+		/**
+		 * 訊息區（`scrollBody`）的長方形 —— 提醒要貼在它的最上面。
+		 *
+		 * 舊版（≤ DSH 0.2.1）的 dock 就在 `scrollBody` 裡面，`closest` 找得到；
+		 * 0.2.2 起 dock 搬到 `composerSeat`（訊息區的**兄弟**），`closest` 一定是 null，
+		 * 提醒就會退回「輸入框上方」（畫面底部）。所以再把範圍往上放一層：
+		 * 從 dock 的祖先裡找第一個**含有** `scrollBody`、但自己不是它的節點。
+		 * @param {object} dock - `[data-composer-dock]` 那個節點
+		 * @returns {object|null} `getBoundingClientRect()` 的結果
+		 */
+		function messageAreaRect(dock) {
+			try {
+				const inner = dock?.closest?.('[class*="scrollBody"]');
+				if (inner !== null && inner !== undefined) return inner.getBoundingClientRect?.() ?? null;
+				let node = dock?.parentElement ?? null;
+				for (let depth = 0; node !== null && node !== undefined && depth < 8; depth += 1, node = node.parentElement ?? null) {
+					const found = node.querySelector?.('[class*="scrollBody"]');
+					if (found === null || found === undefined) continue;
+					if (found.contains?.(dock) === true) continue;
+					return found.getBoundingClientRect?.() ?? null;
+				}
+			} catch {
+				/* 量不到就讓呼叫端退回 dock.top */
+			}
+			return null;
 		}
 
 		/** 讀「延後到什麼時候」（毫秒；0＝沒延後）。 */
@@ -1130,12 +1253,17 @@ window.__ModuleLoader__.load({
 						const element = bannerRef.current;
 						const dock = element?.closest?.("[data-composer-dock]") ?? element?.parentElement ?? null;
 						if (dock === null || dock === undefined) return;
-						const scroll = dock.closest?.('[class*="scrollBody"]') ?? null;
-						const next = handoffAnchor({
-							dock: dock.getBoundingClientRect?.() ?? null,
-							scroll: scroll?.getBoundingClientRect?.() ?? null,
-						});
-						if (next !== null) setAnchor((previous) => (previous?.left === next.left && previous?.top === next.top && previous?.width === next.width ? previous : next));
+						// 三個量測都要：dock（對話欄寬度）、訊息區（最上面）、fixed 參照框（座標系）。
+						const block = fixedBlockRect(element);
+						const next =
+							handoffAnchor({
+								dock: dock.getBoundingClientRect?.() ?? null,
+								scroll: messageAreaRect(dock),
+								block,
+							}) ?? fallbackAnchor(block);
+						if (next !== null) {
+							setAnchor((previous) => (previous?.left === next.left && previous?.top === next.top && previous?.width === next.width ? previous : next));
+						}
 					} catch {
 						/* 量不到就用後備位置（畫面不會壞） */
 					}
@@ -4381,6 +4509,8 @@ window.__ModuleLoader__.load({
 		exports.handoffLevel = handoffLevel;
 		exports.handoffPrompt = handoffPrompt;
 		exports.handoffAnchor = handoffAnchor;
+		exports.fallbackAnchor = fallbackAnchor;
+		exports.establishesFixedBlock = establishesFixedBlock;
 		exports.readHandoffDefer = readHandoffDefer;
 		exports.receiptChainOf = receiptChainOf;
 		exports.readAnnouncedReceipts = readAnnouncedReceipts;

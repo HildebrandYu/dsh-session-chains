@@ -10,7 +10,7 @@
  *   - 路由必須回 CORS 白名單標頭：頁面 origin 是 `dsh-app://app`，fetch 是跨來源。
  */
 import { spawn } from "node:child_process";
-import { appendFileSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants as fsConstants, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -636,6 +636,53 @@ export const createTitlesHandler = createWriteRoute({
 	},
 });
 
+/** 語音公告 log 的上限（1 MB）；超過就清空重寫，避免市場安裝的機器 log 無限長大。 */
+const VOICE_LOG_MAX_BYTES = 1024 * 1024;
+
+/** `say.sh` 的檢查結果快取（避免每次公告都 stat；30 秒內沿用）。 */
+let voiceScriptCheck = { at: 0, file: "", missing: true, detail: "" };
+
+/**
+ * `voice-say` 技能在不在（跨平台安裝的常見情況：**不在**）。
+ *
+ * 為什麼要檢查（2026-11-07 市場審查）：`say.sh` 來自另一個技能 `voice-say`，不是本外掛附的。
+ * 別人機器上沒有那支腳本時，`spawn` 每一輪都失敗、每次都寫一行 log —— 使用者看不到，
+ * 但磁碟一直長。與其失敗，不如明確回 503，讓前端自己停掉（見 `postAnnouncement`）。
+ * @param file - say.sh 的絕對路徑
+ * @returns `{ok: true}` 或 `{ok: false, error}`（30 秒內重複問同一支腳本會拿到同一個答案）
+ */
+function voiceScriptStatus(file) {
+	const now = Date.now();
+	if (voiceScriptCheck.file === file && now - voiceScriptCheck.at < 30_000) return voiceScriptCheck;
+	let next;
+	try {
+		accessSync(file, fsConstants.X_OK);
+		next = { at: now, file, missing: false, detail: "" };
+	} catch (error) {
+		next = { at: now, file, missing: true, detail: String(error?.message ?? error) };
+	}
+	voiceScriptCheck = next;
+	return next;
+}
+
+/**
+ * 寫一行語音公告 log（有上限，寫不進去不影響功能）。
+ * @param line - 已含時間戳的一行（不含換行）
+ */
+function appendVoiceLog(line) {
+	try {
+		const file = join(STATE_ROOT, "voice-announce.log");
+		try {
+			if (statSync(file).size > VOICE_LOG_MAX_BYTES) writeFileSync(file, "", "utf8");
+		} catch {
+			/* 檔案還不存在或讀不到大小：直接往下寫 */
+		}
+		appendFileSync(file, `${line}\n`);
+	} catch {
+		/* 記不了就算了 */
+	}
+}
+
 /**
  * 語音提示：把一句話交給 `voice-say` 唸出來（不阻塞、失敗靜音）。
  * @param {{script?: string}} [options] - 可覆寫 say.sh 路徑（測試用）
@@ -656,6 +703,17 @@ export function createVoiceHandler({ script = process.env.VOICE_SAY_SCRIPT ?? jo
 			// `engine:"say"` → `--engine say --voice auto`：auto 會走系統朗讀的偏好語音
 			// （實測 com.apple...Shufen_zh-TW_premium），起音比克隆快、也不必等 VoiceStudio。
 			// 沒帶 engine（或其他值）就維持原本行為＝`say.sh` 自己的 auto（有克隆就用克隆）。
+			// 2026-11-07（市場審查）：`say.sh` 來自 `voice-say` 技能，不是本外掛附的 ——
+			// 沒有的話明確回 503，前端會自己停掉這一頁的語音，不再每一輪打進來。
+			const scriptStatus = voiceScriptStatus(script);
+			if (scriptStatus.missing === true) {
+				sendJson(res, 503, {
+					ok: false,
+					code: "voice-unavailable",
+					error: `找不到可執行的 ${script}（需要 voice-say 技能；或設定 VOICE_SAY_SCRIPT）`,
+				});
+				return;
+			}
 			const engine = body.value?.engine === "say" ? "say" : "auto";
 			const args = engine === "say" ? ["--engine", "say", "--voice", "auto", text] : [text];
 			try {
@@ -676,22 +734,14 @@ export function createVoiceHandler({ script = process.env.VOICE_SAY_SCRIPT ?? jo
 				} catch {
 					logFd = null;
 				}
-				try {
-					appendFileSync(join(STATE_ROOT, "voice-announce.log"), `${new Date().toISOString()} announce: ${text}${engine === "say" ? "（系統語音）" : ""}\n`);
-				} catch {
-					/* 記不了就算了 */
-				}
+				appendVoiceLog(`${new Date().toISOString()} announce: ${text}${engine === "say" ? "（系統語音）" : ""}`);
 				const child = spawn(script, args, {
 					detached: true,
 					env,
 					stdio: logFd === null ? "ignore" : ["ignore", "ignore", logFd],
 				});
 				child.on("error", (error) => {
-					try {
-						appendFileSync(join(STATE_ROOT, "voice-announce.log"), `${new Date().toISOString()} spawn error: ${error?.message ?? error}\n`);
-					} catch {
-						/* 記不了就算了 */
-					}
+					appendVoiceLog(`${new Date().toISOString()} spawn error: ${error?.message ?? error}`);
 				});
 				child.unref();
 			} catch {

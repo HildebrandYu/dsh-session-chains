@@ -227,14 +227,45 @@ window.__ModuleLoader__.load({
 		 * @param text - 要唸的字
 		 * @returns Promise<void>
 		 */
+		/**
+		 * 這一頁是否已經確定「沒有 voice-say」。
+		 *
+		 * 宿主在 `say.sh` 不存在時回 503（2026-11-07 市場審查）。收到一次就別再打 ——
+		 * 否則每一輪都會多一次註定失敗的請求。
+		 */
+		let voiceUnavailable = false;
+
+		/**
+		 * 送出一次語音公告（失敗不影響任何功能）。
+		 * @param text - 要唸的句子
+		 * @returns 是否送達（503 或缺料時 false）
+		 */
 		async function postAnnouncement(text) {
-			await fetch(resolveVoiceEndpoint(), {
-				method: "POST",
-				headers: { "content-type": "application/json", accept: "application/json" },
-				// 2026-10-24 使用者要求：先以系統預設語音發音（`engine:"say"` → say.sh 的
-				// `--engine say --voice auto`）。關掉這個設定就回去用克隆聲線。
-				body: JSON.stringify({ text, engine: readSettings().announceSystemVoice === false ? "auto" : "say" }),
-			}).catch(() => {});
+			if (voiceUnavailable) return false;
+			try {
+				const response = await fetch(resolveVoiceEndpoint(), {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					// 2026-10-24 使用者要求：先以系統預設語音發音（`engine:"say"` → say.sh 的
+					// `--engine say --voice auto`）。關掉這個設定就回去用克隆聲線。
+					body: JSON.stringify({ text, engine: readSettings().announceSystemVoice === false ? "auto" : "say" }),
+				});
+				if (response?.status === 503) {
+					// 這台機器沒有 `voice-say` 的 say.sh：停掉這一頁的語音，並把設定關掉，
+					// 讓使用者下次打開 ⚙ 時看到的就是「關」。
+					voiceUnavailable = true;
+					console.warn("[session-chains] 語音提示已停用：這台機器找不到 voice-say 的 say.sh");
+					try {
+						writeSettings({ voiceAnnounce: false });
+					} catch {
+						/* 記不住就算了 */
+					}
+					return false;
+				}
+				return response?.ok === true;
+			} catch {
+				return false;
+			}
 		}
 
 		/** 接手提示只唸一次：哪幾場已經唸過（localStorage，陣列存 sessionId）。 */
@@ -378,6 +409,44 @@ window.__ModuleLoader__.load({
 				}
 			}
 			return { status: "applied", applied, failed, payload };
+		}
+
+		/**
+		 * 把「被編號改過」的標題**全部改回原樣**（2026-11-07 市場審查：編號要能收回去）。
+		 *
+		 * 走的是同一條管線（`applyNumberingPlan` 的 `restores`）：只呼叫 `sessions.rename`，
+		 * 再把結果回報給宿主 —— 宿主那條路由看到 `to` 等於備份值就把備份清掉。
+		 * 呼叫端要負責「還原之後不要再自動編號」（暫停＋收回同意），否則下一次輪詢又會被改回去。
+		 * @param {object} payload - 面板手上的 payload（`titles` 是備份、`chains` 提供目前標題）
+		 * @param {{sessions?: object|null, post?: Function}} [deps] - 依賴注入（測試用）
+		 * @returns {Promise<{restored: number, failed: number}>}
+		 */
+		async function restoreAllTitles(payload, deps = {}) {
+			const titles = payload?.titles !== null && typeof payload?.titles === "object" ? payload.titles : {};
+			const byId = new Map();
+			for (const chain of Array.isArray(payload?.chains) ? payload.chains : []) {
+				for (const session of Array.isArray(chain?.sessions) ? chain.sessions : []) {
+					if (typeof session?.id === "string") byId.set(session.id, session);
+				}
+			}
+			const restores = [];
+			for (const [sessionId, original] of Object.entries(titles)) {
+				if (typeof original !== "string" || original.trim() === "") continue;
+				const current = byId.get(sessionId)?.title ?? null;
+				if (current === original) continue; // 已經是同一個標題：不必再改
+				restores.push({ sessionId, from: current, to: original });
+			}
+			if (restores.length === 0) return { restored: 0, failed: 0 };
+			// 依賴一律由呼叫端給：`sessionsService`／`postTitles` 是 `apply()` 裡面的東西，
+			// 模組層的函式看不到它們（2026-11-07 實測：直接呼叫會取不到服務而安靜地還原 0 場）。
+			const result = await applyNumberingPlan({
+				plan: { items: [], restores, total: restores.length, needsConfirm: false },
+				sessions: deps.sessions ?? null,
+				post: typeof deps.post === "function" ? deps.post : undefined,
+				paused: false,
+				force: true,
+			});
+			return { restored: result.applied.length, failed: result.failed.length };
 		}
 
 		/**
@@ -626,8 +695,10 @@ window.__ModuleLoader__.load({
 			hudBg: "#FFE58F", // HUD 警示時的底色（達門檻才出現）
 			highlight: "#CFE7FF", // 交接鏈「你在這裡」的亮底（反光）
 			badge: "#FFE58F", // 面板鏈標題／「起點」的黃底
-			// 勾選項：工作區區塊要不要出現那顆上下箭頭（使用者可以在設定裡關掉）。
-			foldWorkspace: true,
+			// 勾選項：工作區區塊要不要出現那顆上下箭頭（使用者可以在設定裡打開）。
+			// 2026-11-07（市場審查）：三個「會動到別人的東西」的預設一律關 ——
+			// 從商店安裝的人沒有預期這個外掛會改他的工作區列、自己開新對話、或發出聲音。
+			foldWorkspace: false,
 			// HUD 五段：哪幾段要顯示（2026-10-18 使用者指示）。
 			showBalance: true,
 			showToday: true,
@@ -648,14 +719,18 @@ window.__ModuleLoader__.load({
 			showCardSummary: false,
 			stripIconSize: 15,
 			// 2026-10-18 使用者指定：到達門檻、這一輪結束後**自動交接**——
-			// 生成交接詞 → 開新對話 → 貼上 → 送出 → 切過去（一個開關；預設開，可關）。
-			autoHandoff: true,
+			// 生成交接詞 → 開新對話 → 貼上 → 送出 → 切過去（一個開關）。
+			// 2026-11-07（市場審查）：預設**關**。它會自己建會話、選模型、送訊息再切走，
+			// 對剛從商店安裝的人是「沒有預期、而且看起來像外掛自己動手」。
+			autoHandoff: false,
 			// 2026-10-24 使用者要求：交接完成／已交接時用語音提示（用自己的克隆聲線）。
 			// 2026-10-24 晚重新定義：**每一輪回答結束**（＝完成工作）唸「<鏈>交接鏈已完成」；
 			// 接手場的第一輪結束（＝交接完成）唸「<鏈>交接鏈已接手」。舊版綁硬門檻，幾乎不會響。
 			// 同日追加：**先用系統預設語音**（起音快、不必等 VoiceStudio），關掉就回克隆。
 			announceSystemVoice: true,
-			voiceAnnounce: true,
+			// 2026-11-07（市場審查）：預設**關**。它依賴 `$DSH_HOME/skills/voice-say`（不是本外掛附的），
+			// 別人的機器上沒有那支腳本，每一輪都會 spawn 失敗並寫 log。要唸請自己打開。
+			voiceAnnounce: false,
 		};
 
 		/** 排序鍵的合法值（讀到別的一律回預設）。 */
@@ -1476,6 +1551,48 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/** 「編號已經人同意過」的旗標（2026-11-07 市場審查：第一次套用要先問）。 */
+		const NUMBERING_CONSENT_KEY = "dsh.session-chains.numbering-consented";
+
+		/**
+		 * 讀「使用者已經同意過自動編號」。
+		 * @returns 是否同意過（第一次安裝＝false）
+		 */
+		function readNumberingConsent() {
+			try {
+				return globalThis.localStorage?.getItem(NUMBERING_CONSENT_KEY) === "1";
+			} catch {
+				return false;
+			}
+		}
+
+		/**
+		 * 記住「使用者同意過自動編號」。
+		 * @param granted - 是否同意
+		 */
+		function writeNumberingConsent(granted) {
+			try {
+				if (granted === true) globalThis.localStorage?.setItem(NUMBERING_CONSENT_KEY, "1");
+				else globalThis.localStorage?.removeItem(NUMBERING_CONSENT_KEY);
+			} catch {
+				/* 記不住就算了（下一次仍會再問一次） */
+			}
+		}
+
+		/**
+		 * 這份編號計畫要不要先問過使用者（第一次套用）。
+		 *
+		 * 2026-11-07（市場審查）：編號會直接改掉既有對話的標題，所以**第一次**一定要人按「套用」；
+		 * 同意過之後才恢復自動（仍受 `maxAuto` 的重編上限保護）。
+		 * @param {object|null} plan - 宿主算出來的編號計畫
+		 * @param {boolean} consented - 使用者是否已經同意過
+		 * @returns {boolean} 是否要停下來問
+		 */
+		function numberingNeedsConsent(plan, consented) {
+			const items = Array.isArray(plan?.items) ? plan.items.length : 0;
+			return consented !== true && items > 0;
+		}
+
 		/** 卡片展開狀態的 localStorage key（展開與「哪幾條鏈被打開」都要記住）。 */
 		const CARD_KEY = "dsh.session-chains.card";
 
@@ -2098,7 +2215,9 @@ window.__ModuleLoader__.load({
 								"div",
 								{ "data-numbering-status": state.status, style: { fontSize: "10px", opacity: 0.7, padding: "2px 8px" } },
 								state.status === "needs-confirm"
-									? `要重編 ${state.pending} 場 — 按這裡套用`
+									? state.firstRun === true
+										? `第一次套用編號：${state.pending} 場（會改這些對話的標題）— 按這裡套用`
+										: `要重編 ${state.pending} 場 — 按這裡套用`
 									: `編號失敗 ${state.failed} 場（下一輪再試）`,
 								state.status === "needs-confirm"
 									? h("button", { "data-confirm-numbering": String(state.pending), type: "button", onClick: () => numbering.confirm(data), style: { ...cardStripStyle, marginLeft: "6px" } }, "套用")
@@ -2801,6 +2920,36 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 把「直接動 DOM」的清理器交給 `ctx.effect`。
+		 *
+		 * 卡片（`mountCard`）與工作區折疊箭頭（`mountWorkspaceFold`）都不經過插槽系統，
+		 * 而是自己插進側邊欄的 DOM。插槽註冊由 `ctx.slots` 負責收，這兩個不是 ——
+		 * 沒把 disposer 交出去，停用外掛之後它們要等頁面重新整理才消失（2026-11-07 市場審查）。
+		 *
+		 * 舊宿主沒有 `ctx.effect` 時退回原本行為：disposer 仍以 `globalThis` 上的 key 留著，
+		 * 下一次載入（HMR）或重新整理會收掉。
+		 * @param {object} ctx - 瀏覽器端 context
+		 * @param {Array<Function>} disposers - 各個掛載回傳的清理器
+		 * @param {string} [label] - 給 `ctx.effect` 的說明（出現在除錯輸出裡）
+		 * @returns {number} 成功交給 ctx.effect 的數量
+		 */
+		function registerDirectDisposers(ctx, disposers, label = "session-chains: 側欄卡片與工作區折疊器") {
+			let registered = 0;
+			for (const dispose of Array.isArray(disposers) ? disposers : []) {
+				if (typeof dispose !== "function") continue;
+				// 舊宿主沒有這個 API：不清點、不假裝交出去（disposer 仍在 globalThis，重整時收）。
+				if (typeof ctx?.effect !== "function") continue;
+				try {
+					ctx.effect(() => dispose, label);
+					registered += 1;
+				} catch (error) {
+					console.warn("[session-chains] 清理註冊失敗（停用後可能要重整頁面）：", error?.message ?? error);
+				}
+			}
+			return registered;
+		}
+
+		/**
 		 * 掛載兩個插槽元件。
 		 * @param ctx - cordis client context
 		 */
@@ -2861,7 +3010,7 @@ window.__ModuleLoader__.load({
 			const numbering = (() => {
 				let paused = readPauseFlag();
 				let lastSignature = null;
-				let state = { paused, status: "idle", applied: 0, failed: 0, pending: 0, at: 0 };
+				let state = { paused, status: "idle", applied: 0, failed: 0, pending: 0, at: 0, firstRun: false };
 				const listeners = new Set();
 				const setState = (patch) => {
 					state = { ...state, ...patch };
@@ -2876,8 +3025,15 @@ window.__ModuleLoader__.load({
 					if (!force && plan.needsConfirm === true) {
 						// 顯示「會被換號」的場次數（首次編號不算重編，所以不會走到這裡）。
 						const pending = Number.isFinite(Number(plan.renumbered)) ? Number(plan.renumbered) : Array.isArray(plan.items) ? plan.items.length : 0;
-						setState({ status: "needs-confirm", pending });
-						return;
+						setState({ status: "needs-confirm", pending, firstRun: false });
+						return null;
+					}
+					// 2026-11-07（市場審查）：**第一次套用也要人按一次**。編號會改掉既有對話的標題，
+					// 對剛安裝的人是「沒預期、又沒有還原入口」的改動；按過一次「套用」之後才恢復自動。
+					if (!force && numberingNeedsConsent(plan, readNumberingConsent())) {
+						const pending = Array.isArray(plan.items) ? plan.items.length : 0;
+						setState({ status: "needs-confirm", pending, firstRun: true });
+						return null;
 					}
 					lastSignature = signature;
 					setState({ status: "running" });
@@ -2895,8 +3051,10 @@ window.__ModuleLoader__.load({
 						failed: result.failed.length,
 						pending: 0,
 						at: Date.now(),
+						firstRun: false,
 					});
 					if (result.applied.length > 0) for (const listener of appliedListeners) listener(result);
+					return result;
 				};
 				const appliedListeners = new Set();
 				return {
@@ -2922,9 +3080,13 @@ window.__ModuleLoader__.load({
 						return paused;
 					},
 					run,
-					/** 使用者按了「套用」：用同一份計畫強制再跑一次。 */
-					confirm(payload) {
-						return run(payload, { force: true });
+					/** 使用者按了「套用」：用同一份計畫強制再跑一次；成功就記住「同意過」。 */
+					async confirm(payload) {
+						const result = await run(payload, { force: true });
+						if (result !== null && result !== undefined && Array.isArray(result.applied) && result.applied.length > 0) {
+							writeNumberingConsent(true);
+						}
+						return result;
 					},
 				};
 			})();
@@ -3173,6 +3335,9 @@ window.__ModuleLoader__.load({
 				const [assigning, setAssigning] = React.useState(null);
 				// 「交接→新對話」進行中（避免連點開出兩個對話）。
 				const [starting, setStarting] = React.useState(false);
+				// 「還原全部原標題」：兩段式確認（編號是可以一鍵收回去的）。
+				const [restoreAsk, setRestoreAsk] = React.useState(false);
+				const [restoring, setRestoring] = React.useState(false);
 				const [assignDraft, setAssignDraft] = React.useState("");
 				const [renameError, setRenameError] = React.useState("");
 				// ⚙ 設定（門檻／字級／提醒顏色）。改一個欄位就立刻寫入並套用，不用按儲存。
@@ -3210,6 +3375,8 @@ window.__ModuleLoader__.load({
 				}, [open, data]);
 				// 套用成功 → 重抓（標題變了，面板與左側欄都要跟上）。
 				React.useEffect(() => numbering.onApplied(() => reload()), [numbering]);
+				// 「還原全部原標題」的入口只在真的有備份時出現。
+				const titleBackupCount = data?.titles !== null && typeof data?.titles === "object" ? Object.keys(data.titles).length : 0;
 				if (!open) return null;
 
 				/**
@@ -3472,8 +3639,62 @@ window.__ModuleLoader__.load({
 										style: { color: "var(--dsw-alias-label-tertiary)", flexBasis: "100%", fontSize: "11px" },
 									},
 									numberingState.status === "needs-confirm"
-										? `編號：要重編 ${numberingState.pending} 場（按上面的「套用」）`
+										? numberingState.firstRun === true
+											? `編號：第一次套用 ${numberingState.pending} 場（會改這些對話的標題，按「套用」才會做）`
+											: `編號：要重編 ${numberingState.pending} 場（按上面的「套用」）`
 										: `編號：本次重編 ${numberingState.applied} 場${numberingState.failed > 0 ? `・失敗 ${numberingState.failed} 場` : ""}`,
+								)
+							: null,
+						// 2026-11-07（市場審查）：編號要能一鍵收回去 —— 有備份就給入口，兩段式確認。
+						titleBackupCount > 0
+							? h(
+									"span",
+									{ style: { color: "var(--dsw-alias-label-tertiary)", flexBasis: "100%", fontSize: "11px" } },
+									`原標題備份 ${titleBackupCount} 筆`,
+									h(
+										"button",
+										{
+											"data-sc-restore-titles": restoreAsk ? "confirm" : "idle",
+											type: "button",
+											disabled: restoring,
+											title: "把被編號改過的標題全部改回原本的（會一併暫停自動編號，之後可再打開）",
+											onClick: async () => {
+												if (restoring) return;
+												if (!restoreAsk) {
+													setRestoreAsk(true);
+													return;
+												}
+												setRestoring(true);
+												try {
+													const result = await restoreAllTitles(data, {
+													sessions: sessionRenamer(sessionsService()),
+													post: postTitles,
+												});
+													if (result.restored > 0) {
+														// 還原之後不要再自動編號，否則下一次輪詢又被改回去。
+														numbering.setPaused(true);
+														writeNumberingConsent(false);
+														setRenameError(`已還原 ${result.restored} 場原標題（自動編號已暫停）`);
+													} else {
+														setRenameError("沒有需要還原的標題");
+													}
+													reload();
+												} catch (error) {
+													setRenameError(`還原失敗：${error?.message ?? error}`);
+												} finally {
+													setRestoring(false);
+													setRestoreAsk(false);
+												}
+											},
+											style: {
+												...buttonStyle,
+												marginLeft: "6px",
+												borderColor: restoreAsk ? "#B91C1C" : undefined,
+												color: restoreAsk ? "#B91C1C" : undefined,
+											},
+										},
+										restoring ? "還原中…" : restoreAsk ? "確定還原？" : "還原全部原標題",
+									),
 								)
 							: null,
 						// 交接→新對話（2026-10-18 使用者要求）：讀 AI 寫好的接續提示詞，開新對話並送出。
@@ -4432,19 +4653,24 @@ window.__ModuleLoader__.load({
 			};
 
 			// 側邊欄卡片：放在「今日消費」卡之前；找不到掛載點就安全退回（只有原本的按鈕）。
+			// 2026-11-07（市場審查）：兩個「直接動 DOM」的東西（卡片、折疊箭頭）回傳的 disposer
+			// 要交給 `ctx.effect`，否則停用外掛之後它們要等頁面重新整理才消失。
+			const directDisposers = [];
 			try {
 				if (createRoot !== null) {
-					mountCard({
-						createRoot,
-						onPlaced: (placed) => store.setCardPlaced(placed === true),
-						component: createCard({
-							numbering,
-							openSession,
-							workspaceService,
-							openPanel: () => store.setOpen(true),
-							statusSource,
+					directDisposers.push(
+						mountCard({
+							createRoot,
+							onPlaced: (placed) => store.setCardPlaced(placed === true),
+							component: createCard({
+								numbering,
+								openSession,
+								workspaceService,
+								openPanel: () => store.setOpen(true),
+								statusSource,
+							}),
 						}),
-					});
+					);
 				}
 			} catch (error) {
 				console.warn("[session-chains] 卡片掛載失敗（其餘功能照常）：", error?.message ?? error);
@@ -4452,10 +4678,12 @@ window.__ModuleLoader__.load({
 
 			// 上方「工作區／會話」區塊也可收合（2026-10-18 使用者指示：加了卡片之後它太佔空間）。
 			try {
-				mountWorkspaceFold({});
+				directDisposers.push(mountWorkspaceFold({}));
 			} catch (error) {
 				console.warn("[session-chains] 工作區折疊器掛載失敗（其餘功能照常）：", error?.message ?? error);
 			}
+
+			registerDirectDisposers(ctx, directDisposers);
 
 			ctx.slots.inject("sidebar.footer.action", () =>
 				ctx.slots.register(
@@ -4493,6 +4721,15 @@ window.__ModuleLoader__.load({
 		exports.sortChains = sortChains;
 		exports.subscribeSettings = subscribeSettings;
 		exports.mountCard = mountCard;
+		exports.registerDirectDisposers = registerDirectDisposers;
+		exports.postAnnouncement = postAnnouncement;
+		exports.numberingNeedsConsent = numberingNeedsConsent;
+		exports.restoreAllTitles = restoreAllTitles;
+		exports.readNumberingConsent = readNumberingConsent;
+		exports.writeNumberingConsent = writeNumberingConsent;
+		exports.resetVoiceAvailability = () => {
+			voiceUnavailable = false;
+		};
 		exports.readCardState = readCardState;
 		exports.readSettings = readSettings;
 		exports.writeSettings = writeSettings;

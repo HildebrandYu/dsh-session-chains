@@ -221,6 +221,10 @@ const sandbox = {
 			}
 			return { ok: true, status: 200, json: async () => ({ ok: true, prompt: nextPromptForFetch }) };
 		}
+		// 語音提示路由（2026-11-07：沒有 voice-say 的機器回 503，前端要停掉）。
+		if (String(url).includes("session-chains.say")) {
+			return { ok: sayRouteStatus < 400, status: sayRouteStatus, json: async () => ({ ok: sayRouteStatus < 400 }) };
+		}
 		// 選模型路由（2026-10-20 第二版）：宿主直接呼叫 sessionController.selectModel。
 		if (String(url).includes("session-chains.select-model")) {
 			let request = {};
@@ -297,6 +301,8 @@ const promptCalls = [];
 const selectModelCalls = [];
 /** 選模型路由的回應狀態（測 fallback：非 200 時要走 Remote）。 */
 let selectModelRouteStatus = 200;
+/** 語音路由的回應狀態（503＝這台機器沒有 voice-say 的 say.sh）。 */
+let sayRouteStatus = 200;
 /** 呼叫順序的時間軸（驗「先選模型、再送第一句」）。 */
 const timeline = [];
 const remoteSelectCalls = [];
@@ -324,6 +330,11 @@ const fakeSessions = {
 					prompt: async (content, mode) => {
 						promptCalls.push({ sessionId, content, mode });
 						timeline.push({ kind: "prompt", sessionId });
+						return { ok: true };
+					},
+					// 2026-11-07：「還原全部原標題」走的就是內建這條 rename（與自動編號同一條路）。
+					rename: async (title) => {
+						renameCalls.push({ sessionId, title });
 						return { ok: true };
 					},
 				},
@@ -355,6 +366,8 @@ function setSessionStatuses(entries) {
 	for (const [id, status] of entries) statusState.set(id, status);
 	for (const listener of statusListeners) listener();
 }
+/** `ctx.effect` 收到的清理器（市場審查：卡片與折疊箭頭要能被收掉）。 */
+const effects = [];
 const ctx = {
 	get: (name) => {
 		if (name === "uiWorkspace") return fakeWorkspace;
@@ -364,6 +377,13 @@ const ctx = {
 	},
 	// 內建的 Session Remote（選模型）：client 外掛用 ctx.remote.session 呼叫。
 	remote: { session: fakeRemoteSession },
+	// 2026-11-07（市場審查）：直接動 DOM 的掛載（卡片／折疊箭頭）要把 disposer 交給 ctx.effect，
+	// 停用外掛時才收得掉。這裡只記錄，讓測試確認「有交」與「收了不炸」。
+	effect(execute, label) {
+		const dispose = typeof execute === "function" ? execute() : undefined;
+		effects.push({ label, dispose });
+		return dispose;
+	},
 	slots: {
 		inject(name, callback) {
 			callback();
@@ -374,8 +394,17 @@ const ctx = {
 	},
 };
 
+// 2026-11-07（市場審查）：三個「會動到別人的東西」的預設必須是關的。
+const { DEFAULT_SETTINGS } = sandbox.captured.exports;
+check(
+	DEFAULT_SETTINGS.foldWorkspace === false && DEFAULT_SETTINGS.autoHandoff === false && DEFAULT_SETTINGS.voiceAnnounce === false,
+	"預設全部關閉：不動工作區列、不自己開對話、不出聲（市場審查要求）",
+	JSON.stringify({ fold: DEFAULT_SETTINGS.foldWorkspace, auto: DEFAULT_SETTINGS.autoHandoff, voice: DEFAULT_SETTINGS.voiceAnnounce }),
+);
+// 下面的測試要測折疊器與卡片，先把「工作區可折疊」打開（等同使用者在 ⚙ 勾起來）。
+sandbox.captured.exports.writeSettings({ foldWorkspace: true, autoHandoff: false });
 sandbox.captured.exports.apply(ctx);
-// 測試預設關掉自動交接（預設是開的），避免一渲染橫幅就送訊息、清掉提示詞檔；
+// 測試期間關掉自動交接，避免一渲染橫幅就送訊息、清掉提示詞檔；
 // 要測自動的區塊會自己打開。
 sandbox.captured.exports.writeSettings({ autoHandoff: false });
 console.log(`id=${sandbox.captured.id}`);
@@ -390,6 +419,27 @@ check(
 	"四個插槽都註冊了（底部按鈕／浮層面板／HUD／交接提醒）",
 	`找到 ${registrations.length}`,
 );
+
+// 2026-11-07（市場審查）：卡片與折疊箭頭是「直接動 DOM」的掛載，disposer 必須交給 ctx.effect，
+// 否則停用外掛之後要等頁面重新整理才消失。
+const cardEffect = effects.find((entry) => String(entry.label ?? "").includes("卡片"));
+// 沙箱沒有 react-dom/client，卡片不會真的掛（`createRoot` 為 null），所以這裡看到的是折疊箭頭那一筆。
+check(effects.length >= 1, "直接動 DOM 的掛載（折疊箭頭）已把 disposer 交給 ctx.effect", `effects=${effects.length}`);
+// 兩個掛載都在 apply 裡走同一個 `registerDirectDisposers`：直接測它，才蓋得到卡片那一條。
+const registerDirectDisposers = sandbox.captured.exports.registerDirectDisposers;
+const seen = [];
+const registeredCount = registerDirectDisposers({ effect: (execute, label) => { seen.push({ dispose: execute(), label }); } }, [() => {}, () => {}]);
+check(registeredCount === 2 && seen.length === 2, "registerDirectDisposers：兩個清理器都交出去", `count=${registeredCount}`);
+check(seen.every((entry) => typeof entry.dispose === "function" && String(entry.label).includes("session-chains")), "每個清理器都可呼叫，且帶得出處標籤");
+check(registerDirectDisposers({}, [() => {}]) === 0, "沒有 ctx.effect 的舊宿主：退回原本行為（不拋錯）");
+check(registerDirectDisposers({ effect: () => {} }, [null, undefined, "x"]) === 0, "非函式一律略過（壞值不會讓 apply 炸掉）");
+check(cardEffect !== undefined && typeof cardEffect.dispose === "function", "交出去的是可呼叫的清理器");
+try {
+	cardEffect?.dispose?.();
+	check(true, "呼叫清理器不會拋錯（停用外掛時安全）");
+} catch (error) {
+	check(false, "呼叫清理器不會拋錯（停用外掛時安全）", String(error?.message ?? error));
+}
 
 // ① 面板關著 → null
 check((await settle(panel.component)) === null, "面板預設關著（回傳 null）");
@@ -692,6 +742,48 @@ function planOf(items, extra = {}) {
 {
 	const result = await applyPlan({ plan: planOf([]), sessions: fakeSessions, post: async () => {} });
 	check(result.status === "skipped-nothing", "沒有差異就不打 API");
+}
+
+// ── 2026-11-07（市場審查）：第一次套用編號要人按一次「套用」 ────────────────
+{
+	const { numberingNeedsConsent, readNumberingConsent, writeNumberingConsent } = sandbox.captured.exports;
+	const plan = { items: [{ sessionId: "a", to: "x-001" }], total: 1, restores: [] };
+	check(numberingNeedsConsent(plan, false) === true, "沒同意過 + 有東西要改 → 停下來問");
+	check(numberingNeedsConsent(plan, true) === false, "同意過 → 恢復自動編號");
+	check(numberingNeedsConsent({ items: [], restores: [] }, false) === false, "沒有東西要改 → 不必問（不吵人）");
+	check(numberingNeedsConsent(null, false) === false, "沒有計畫 → 不必問");
+
+	store.delete("dsh.session-chains.numbering-consented");
+	check(readNumberingConsent() === false, "預設：沒同意過（第一次安裝）");
+	writeNumberingConsent(true);
+	check(readNumberingConsent() === true, "按過「套用」之後記得住（跨重新整理）");
+	writeNumberingConsent(false);
+	check(readNumberingConsent() === false, "可以收回同意");
+}
+
+// ── 2026-11-07（市場審查）：「還原全部原標題」要把編號收回去 ────────────────
+{
+	const restoreAllTitles = sandbox.captured.exports.restoreAllTitles;
+	const renames = [];
+	const posts = [];
+	const payload = {
+		titles: { "s-1": "我原本的標題", "s-2": "另一場原本的標題", "s-3": "已經是這個了" },
+		chains: [{ chain: "x", sessions: [{ id: "s-1", title: "x-001" }, { id: "s-2", title: "x-002" }, { id: "s-3", title: "已經是這個了" }] }],
+	};
+	const result = await restoreAllTitles(payload, {
+		sessions: { rename: async (sessionId, title) => { renames.push([sessionId, title]); return { ok: true }; } },
+		post: async (body) => { posts.push(body); return { ok: true }; },
+	});
+	check(result.restored === 2 && result.failed === 0, "兩場被改過的標題被還原（已經正確的不動）", JSON.stringify(result));
+	check(renames.length === 2 && renames.every(([id, title]) => payload.titles[id] === title), "呼叫的是 rename，而且改回備份值", JSON.stringify(renames));
+	check(posts.length === 1 && posts[0].applied.length === 2, "改完回報一次（宿主才會把備份清掉）");
+
+	const nothing = await restoreAllTitles({ titles: { "s-3": "已經是這個了" }, chains: [{ chain: "x", sessions: [{ id: "s-3", title: "已經是這個了" }] }] }, {
+		sessions: { rename: async () => ({ ok: true }) },
+		post: async () => ({ ok: true }),
+	});
+	check(nothing.restored === 0, "沒有需要還原的 → 不打 rename");
+	check((await restoreAllTitles(null, { sessions: { rename: async () => ({ ok: true }) } })).restored === 0, "壞 payload 不拋錯");
 }
 
 // ── Task 5（2026-10-18）：側邊欄卡片 ────────────────────────────────────────
@@ -1102,6 +1194,8 @@ function containerCount(foot) {
 	store.delete(FOLD_KEY);
 
 	// ① 箭頭插進內建那一列的最前面，沒有文字，預設展開
+	// （2026-11-07 起預設是關的，測試要自己打開才會有箭頭）
+	sandbox.captured.exports.writeSettings({ foldWorkspace: true });
 	const first = fakeWorkspaceSidebar();
 	const dispose = mountFold({ document: first.doc, reconcileMs: 5 });
 	const toggle = first.header.children[0];
@@ -1357,7 +1451,10 @@ function containerCount(foot) {
 	check(defaults.hardSteps === 320 && defaults.warnSteps === 200, "預設門檻依實際用量重定（提醒 200／強制 320）", `${defaults.warnSteps}/${defaults.hardSteps}`);
 	check(defaults.hardTokens === 480000 && defaults.warnTokens === 320000, "預設上下文門檻依實際用量重定（320k／480k）");
 	check(defaults.font === 12 && /^#[0-9A-Fa-f]{6}$/u.test(defaults.accent), "預設字級與提醒顏色");
-	check(defaults.autoHandoff === true, "預設：到達門檻自動交接（生成＋開新對話＋切過去；可關）");
+	// 2026-11-07（市場審查）：自動交接預設關（它會自己建會話、送訊息、切走）。
+	check(defaults.autoHandoff === false, "預設：不自動交接（要自己到 ⚙ 打開）");
+	check(defaults.voiceAnnounce === false, "預設：不出聲（voice-say 不是本外掛附的）");
+	check(defaults.foldWorkspace === false, "預設：不在工作區列插折疊箭頭");
 	// 後面的橫幅測試先關掉自動，避免一渲染就送訊息／開對話。
 	writeSettings({ autoHandoff: false });
 
@@ -2067,6 +2164,7 @@ console.log("");
 	};
 
 	// ① 先收合（模擬使用者原本就是折疊狀態）
+	sandbox.captured.exports.writeSettings({ foldWorkspace: true });
 	store.delete("dsh.session-chains.workspace-fold");
 	const { doc, region, browser, header } = fixture();
 	const dispose = mountFold({ document: doc, reconcileMs: 5 });
@@ -2098,7 +2196,8 @@ console.log("");
 	dispose();
 	writeSettings(DEFAULT_SETTINGS);
 	store.delete("dsh.session-chains.workspace-fold");
-	check(readSettings().foldWorkspace === true, "（收尾）設定回到預設");
+	check(readSettings().foldWorkspace === DEFAULT_SETTINGS.foldWorkspace, "（收尾）設定回到預設（折疊預設關）");
+	check(DEFAULT_SETTINGS.foldWorkspace === false, "（收尾）預設值就是關的（市場審查）");
 }
 
 // ── 2026-10-18：面板搜尋／多選歸鏈／拖拉歸鏈 ─────────────────────────────
@@ -2558,6 +2657,76 @@ console.log("");
 
 	store.delete("dsh.session-chains.recipient-announced");
 	payloadForFetch = DEMO_PAYLOAD;
+}
+
+// ── 2026-11-07（市場審查）：沒有 voice-say 的機器，語音要自己停掉 ──────────
+{
+	const { postAnnouncement, resetVoiceAvailability, readSettings } = sandbox.captured.exports;
+	const sayCalls = () => fetchCalls.filter((call) => call.url.includes("session-chains.say")).length;
+	sandbox.captured.exports.writeSettings({ voiceAnnounce: true });
+
+	sayRouteStatus = 503;
+	resetVoiceAvailability();
+	const before = sayCalls();
+	const first = await postAnnouncement("測試一");
+	const second = await postAnnouncement("測試二");
+	check(first === false && second === false, "宿主回 503（沒有 say.sh）→ 回 false，不當成成功");
+	check(sayCalls() - before === 1, "503 之後不再打第二次（不會每一輪都失敗一次）", `${sayCalls() - before}`);
+	check(readSettings().voiceAnnounce === false, "並且把「語音提示」設定關掉（使用者下次看到的就是關）");
+
+	sayRouteStatus = 200;
+	resetVoiceAvailability();
+	sandbox.captured.exports.writeSettings({ voiceAnnounce: true });
+	const beforeOk = sayCalls();
+	const ok = await postAnnouncement("測試三");
+	check(ok === true && sayCalls() - beforeOk === 1, "腳本回來（200）→ 正常送達");
+	sandbox.captured.exports.writeSettings({ voiceAnnounce: false });
+	sayRouteStatus = 200;
+	resetVoiceAvailability();
+}
+
+// ── 2026-11-07（市場審查）：面板的「還原全部原標題」（兩段式）──────────────
+{
+	payloadForFetch = {
+		...DEMO_PAYLOAD,
+		titles: { "s-next": "舊標題" },
+		chains: DEMO_PAYLOAD.chains.map((group) => ({
+			...group,
+			sessions: group.sessions.map((session) => (session.id === "s-next" ? { ...session, title: "dsh-demo-002" } : session)),
+		})),
+	};
+	if ((await settle(panel.component)) === null) {
+		(await settle(footer.component))?.props?.onClick?.();
+		await settle(panel.component);
+	}
+	const reloadButton = () => created.find((node) => node.type === "button" && ["重抓", "✓ 已更新"].includes(String(node.children?.[0] ?? "")));
+	reloadButton()?.props?.onClick?.();
+	await new Promise((resolve) => setTimeout(resolve, 450));
+	await settle(panel.component);
+
+	const buttonOf = () => created.find((node) => node.props?.["data-sc-restore-titles"] !== undefined);
+	check(buttonOf() !== undefined, "有備份時，面板出現「還原全部原標題」");
+	check(String(buttonOf()?.children?.[0] ?? "") === "還原全部原標題", "第一次點之前是「還原全部原標題」（不會直接還原）", String(buttonOf()?.children?.[0] ?? ""));
+
+	renameCalls.length = 0;
+	await buttonOf()?.props?.onClick?.();
+	await settle(panel.component);
+	check(String(buttonOf()?.children?.[0] ?? "") === "確定還原？", "第一次點只變成「確定還原？」（兩段式）");
+	check(renameCalls.length === 0, "第一次點不改任何標題");
+
+	await buttonOf()?.props?.onClick?.();
+	await settle(panel.component);
+	check(
+		renameCalls.some((call) => call.sessionId === "s-next" && call.title === "舊標題"),
+		"第二次點才真的把標題改回備份值",
+		JSON.stringify(renameCalls),
+	);
+	check(String(buttonOf()?.children?.[0] ?? "") === "還原全部原標題", "做完之後回到預設字樣（不會卡在確認）");
+
+	payloadForFetch = DEMO_PAYLOAD;
+	reloadButton()?.props?.onClick?.();
+	await new Promise((resolve) => setTimeout(resolve, 450));
+	await settle(panel.component);
 }
 
 // ── 2026-10-20：面板要顯示版本（判斷「頁面是不是還跑舊 bundle」）──────────

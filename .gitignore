@@ -12,3 +12,7 @@ node_modules/
 交接-*.md
 設計-*.md
 計畫-*.md
+
+# npm 憑證與打包產物（絕不進 git）
+.npmrc
+*.tgz

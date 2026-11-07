@@ -17,17 +17,19 @@ cd "$(dirname "$0")/.."
 
 NPM_CACHE="${NPM_CACHE:-/tmp/npm-cache}"
 NPM_LOGS="${NPM_LOGS:-/tmp/npm-logs}"
+# 注意：macOS 內建 bash 3.2 在 `set -u` 下展開「空陣列」會報 unbound variable，
+# 所以下面每處展開都加上加號守衛（bash 3.2 相容寫法）。
 PLAIN=()
 if [ -n "${NPM_USERCONFIG:-}" ]; then
 	PLAIN+=(--userconfig "$NPM_USERCONFIG")
 fi
 
 echo "== 1/4 登入狀態"
-if ! npm whoami --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" "${PLAIN[@]}" >/dev/null 2>&1; then
+if ! npm whoami --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" ${PLAIN[@]+"${PLAIN[@]}"} >/dev/null 2>&1; then
 	echo "   尚未登入。先跑『npm login』（一次性），或用 NPM_USERCONFIG 指向含 token 的 .npmrc。"
 	exit 1
 fi
-echo "   已登入：$(npm whoami --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" "${PLAIN[@]}")"
+echo "   已登入：$(npm whoami --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" ${PLAIN[@]+"${PLAIN[@]}"})"
 
 echo "== 2/4 版號與工作區狀態"
 PACKED="$(node -e 'const p=require("./package.json");process.stdout.write(p.name+"@"+p.version)')"
@@ -42,8 +44,8 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 echo "== 3/4 打包預覽"
-npm publish --dry-run --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" "${PLAIN[@]}" | tail -8
+npm publish --dry-run --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" ${PLAIN[@]+"${PLAIN[@]}"} | tail -8
 
 echo "== 4/4 發佈"
-npm publish --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" "${PLAIN[@]}" "$@"
+npm publish --cache "$NPM_CACHE" --logs-dir "$NPM_LOGS" ${PLAIN[@]+"${PLAIN[@]}"} "$@"
 echo "完成：https://www.npmjs.com/package/${PACKED%@*}"

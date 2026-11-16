@@ -718,6 +718,11 @@ window.__ModuleLoader__.load({
 			// 右側三顆圖示預設比原本大兩級。
 			showCardSummary: false,
 			stripIconSize: 15,
+			// 2026-11-16（使用者要求）：鏈長了以後，越前面的場次越沒有參考價值 ——
+			// 每條鏈只列最近 N 場，比較舊的折成一行，**滑鼠點一下就展開**。
+			// 折疊不是封存：資料、編號、標題全都在，只是預設不佔畫面。
+			// 0 ＝ 全部列出（原本的行為）。
+			keepRecent: 5,
 			// 2026-10-18 使用者指定：到達門檻、這一輪結束後**自動交接**——
 			// 生成交接詞 → 開新對話 → 貼上 → 送出 → 切過去（一個開關）。
 			// 2026-11-07（市場審查）：預設**關**。它會自己建會話、選模型、送訊息再切走，
@@ -752,7 +757,8 @@ window.__ModuleLoader__.load({
 							if (typeof value === "boolean") settings[key] = value;
 						} else if (typeof DEFAULT_SETTINGS[key] === "number") {
 							const number = Number(value);
-							if (Number.isFinite(number) && number > 0) settings[key] = number;
+							// `keepRecent` 的 0 是合法值（＝全部列出）；其餘數字欄位 0 仍當壞值。
+							if (Number.isFinite(number) && (number > 0 || (key === "keepRecent" && number >= 0))) settings[key] = number;
 						} else if (typeof value === "string" && value !== "") {
 							settings[key] = value;
 						}
@@ -768,6 +774,8 @@ window.__ModuleLoader__.load({
 			if (settings.sortDir !== "asc" && settings.sortDir !== "desc") settings.sortDir = DEFAULT_SETTINGS.sortDir;
 			// 卡片右側圖示：夾在 10–24px（存壞了也不會把標題擠爆）。
 			settings.stripIconSize = Math.min(24, Math.max(10, Math.round(Number(settings.stripIconSize) || DEFAULT_SETTINGS.stripIconSize)));
+			// 「每條鏈顯示最近幾場」：0–50；0 ＝ 全部列出。
+			settings.keepRecent = Math.min(50, Math.max(0, Math.round(Number(settings.keepRecent) || 0)));
 			// 顏色一律驗成 `#RRGGBB`，壞值回預設（避免把整個畫面變成透明或黑字黑底）。
 			for (const key of ["accent", "sessionColor", "hudBg", "highlight", "badge"]) {
 				settings[key] = /^#[0-9a-fA-F]{6}$/u.test(String(settings[key])) ? String(settings[key]) : DEFAULT_SETTINGS[key];
@@ -1752,6 +1760,21 @@ window.__ModuleLoader__.load({
 		 * @param {{numbering: object, openSession: Function, workspaceService: Function}} deps - 注入依賴
 		 * @returns 卡片元件
 		 */
+		/**
+		 * `startedAt` → `YYYY-MM-DD`。折疊那一行要讓人不必點就知道裡面多舊。
+		 * @param timestamp - 毫秒時間戳
+		 * @returns 日期字串（壞值回「未知」）
+		 */
+		function formatDay(timestamp) {
+			const value = Number(timestamp);
+			if (!Number.isFinite(value) || value <= 0) return "未知";
+			try {
+				return new Date(value).toISOString().slice(0, 10);
+			} catch {
+				return "未知";
+			}
+		}
+
 		function createCard({ numbering, openSession, workspaceService, openPanel, statusSource }) {
 			return function Card() {
 				const [card, setCard] = React.useState(readCardState);
@@ -1764,6 +1787,9 @@ window.__ModuleLoader__.load({
 				const [archiveAsk, setArchiveAsk] = React.useState("");
 				const [draft, setDraft] = React.useState("");
 				const [renameError, setRenameError] = React.useState("");
+				// 2026-11-16（使用者要求）：哪幾條鏈被「點開」了。放元件 state ——
+				// 卡片會重抓、重繪，放這裡才不會把你剛點開的又收回去（重新整理頁面才回到折疊）。
+				const [foldOpenChains, setFoldOpenChains] = React.useState(() => new Set());
 				// 收合時只顯示「幾條鏈／幾場」，不需要勤抓：5 分鐘。展開才 30 秒。
 				const { data, reload } = useChains(true, card.open ? 30000 : 300000);
 				const current = useCurrentSession(true, workspaceService);
@@ -2176,8 +2202,47 @@ window.__ModuleLoader__.load({
 						// 編號先照「時間順序」算好再排方向：倒過來只換顯示位置，號碼不會跟著換人
 						// （號碼就是標題上的 `鏈名-003`，換人會和標題對不起來）。
 						const listed = (group.sessions ?? []).map((session, index) => ({ session, ordinal: index + 1 }));
-						if (chainOrderOf(group.chain, chainOrder) === "desc") listed.reverse();
-						listed.forEach(({ session, ordinal }) => {
+						// 2026-11-16（使用者要求）：只列最近 N 場，比較舊的折成一行，點一下就展開。
+						// `listed` 是時間序，所以留的是「尾巴」那幾場、折起來的永遠是最前面（最舊）那幾場。
+						// 折疊只是顯示 —— 不動資料、不動編號，也不是封存。
+						const keep = Math.max(0, Math.round(Number(settings.keepRecent) || 0));
+						const hiddenCount = keep > 0 && listed.length > keep ? listed.length - keep : 0;
+						const descending = chainOrderOf(group.chain, chainOrder) === "desc";
+						const folded = hiddenCount > 0 && !foldOpenChains.has(group.chain);
+						const visibleTimeOrder = folded ? listed.slice(hiddenCount) : listed;
+						const shown = descending ? [...visibleTimeOrder].reverse() : visibleTimeOrder;
+						const foldRow =
+							hiddenCount === 0
+								? null
+								: h(
+										"button",
+										{
+											"data-card-fold-older": group.chain,
+											"data-card-fold-state": folded ? "folded" : "open",
+											type: "button",
+											title: folded ? "點一下展開（只是折起來，沒有封存）" : "點一下收回折疊",
+											onClick: (event) => {
+												event.stopPropagation();
+												setFoldOpenChains((previous) => {
+													const next = new Set(previous);
+													if (next.has(group.chain)) next.delete(group.chain);
+													else next.add(group.chain);
+													return next;
+												});
+											},
+											style: { ...cardRowStyle, background: "transparent", fontStyle: "italic", opacity: 0.65, paddingLeft: "18px" },
+										},
+										h(
+											"span",
+											{ style: { flex: "1", textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+											folded
+												? `… 另外 ${hiddenCount} 場（最早 ${formatDay(listed[0]?.session?.startedAt)}）— 點一下展開`
+												: `收合上面 ${hiddenCount} 場`,
+										),
+									);
+						// 折起來的是最舊的那幾場：正序時它們在最上面，反序時在最下面。
+						if (foldRow !== null && !descending) rows.push(foldRow);
+						shown.forEach(({ session, ordinal }) => {
 							const isCurrent = session.id === current;
 							rows.push(
 								h(
@@ -2208,6 +2273,7 @@ window.__ModuleLoader__.load({
 								),
 							);
 						});
+						if (foldRow !== null && descending) rows.push(foldRow);
 					}
 					if (state.status === "needs-confirm" || state.failed > 0) {
 						rows.push(
@@ -3977,6 +4043,25 @@ window.__ModuleLoader__.load({
 										style: { ...inputStyle, width: "86px" },
 									},
 									...[10, 12, 14, 15, 16, 18, 20, 22, 24].map((size) => h("option", { key: size, value: String(size) }, `${size}px`)),
+								),
+							),
+							// 2026-11-16（使用者要求）：鏈長了以後只留最近幾場，其餘折成一行（點一下展開）。
+							field(
+								"每條鏈顯示",
+								h(
+									"span",
+									{ style: { alignItems: "center", display: "flex", gap: "4px" } },
+									h("input", {
+										"data-sc-setting": "keepRecent",
+										type: "number",
+										min: 0,
+										max: 50,
+										step: 1,
+										value: Number(settings.keepRecent) || 0,
+										onChange: (event) => updateSetting({ keepRecent: Math.min(50, Math.max(0, Math.round(Number(event.target.value) || 0))) }),
+										style: { ...inputStyle, width: "64px" },
+									}),
+									h("span", { style: { fontSize: "10px", opacity: 0.6 } }, "場（0＝全部，其餘折起來）"),
 								),
 							),
 							// 顏色（2026-10-18 使用者指示）：四處各自可調，都寫進同一份設定。

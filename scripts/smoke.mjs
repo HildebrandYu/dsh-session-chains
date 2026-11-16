@@ -898,6 +898,69 @@ check(created.filter((node) => node.props?.["data-card-session"] !== undefined).
 	await settle(Card);
 }
 
+// ── 2026-11-16 使用者要求：鏈長了以後只留最近幾場，其餘折成一行（點一下展開；不是封存）
+{
+	const rowsNow = () =>
+		created.filter((node) => node.props?.["data-card-session"] !== undefined).map((node) => node.props["data-card-session"]);
+	const foldRowOf = (chain) => created.find((node) => node.props?.["data-card-fold-older"] === chain);
+
+	sandbox.captured.exports.writeSettings({ keepRecent: 1 });
+	created.find((node) => node.props?.["data-chain-row"] === "dsh-demo").props.onClick();
+	await settle(Card);
+	check(rowsNow().join(",") === "s-next", "只列最近 1 場（舊的被折起來）", rowsNow().join(","));
+	const foldRow = foldRowOf("dsh-demo");
+	check(foldRow !== undefined, "折起來的場次有一行可以點的");
+	check(foldRow?.props?.["data-card-fold-state"] === "folded", "預設是折疊狀態");
+	check(
+		textsOf().some((text) => text.includes("另外 1 場")),
+		"折疊那行寫出還有幾場",
+		textsOf().find((text) => text.includes("另外")) ?? "",
+	);
+
+	foldRow.props.onClick({ stopPropagation: () => {} });
+	await settle(Card);
+	check(rowsNow().join(",") === "s-head,s-next", "點一下就展開全部", rowsNow().join(","));
+	check(foldRowOf("dsh-demo")?.props?.["data-card-fold-state"] === "open", "展開後那一行變成「收合」");
+
+	foldRowOf("dsh-demo").props.onClick({ stopPropagation: () => {} });
+	await settle(Card);
+	check(rowsNow().join(",") === "s-next", "再點一下收回去", rowsNow().join(","));
+
+	// 折起來的是最舊那幾場：正序時它在最上面、反序時跑到最下面（位置跟著資料走，不是釘死）。
+	// 注意：`created` 是「建立順序」（foldRow 先被建立），要驗位置得走實際樹。
+	const treeOrder = (tree) => {
+		const flat = [];
+		const walk = (node) => {
+			if (node === null || node === undefined) return;
+			if (Array.isArray(node)) return node.forEach(walk);
+			if (typeof node !== "object") return;
+			flat.push(node);
+			walk(node.children);
+		};
+		walk(tree);
+		return flat
+			.filter((node) => node.props?.["data-card-session"] !== undefined || node.props?.["data-card-fold-older"] !== undefined)
+			.map((node) => node.props["data-card-session"] ?? "FOLD");
+	};
+	let tree = await settle(Card);
+	check(treeOrder(tree).join(",") === "FOLD,s-next", "正序：折疊那一行在上面", treeOrder(tree).join(","));
+	created.find((node) => node.props?.["data-card-chain-order"] === "dsh-demo").props.onClick({ stopPropagation: () => {} });
+	tree = await settle(Card);
+	check(treeOrder(tree).join(",") === "s-next,FOLD", "反序：折疊那一行在下面", treeOrder(tree).join(","));
+	created.find((node) => node.props?.["data-card-chain-order"] === "dsh-demo").props.onClick({ stopPropagation: () => {} });
+	await settle(Card);
+
+	sandbox.captured.exports.writeSettings({ keepRecent: 0 });
+	await settle(Card);
+	check(rowsNow().join(",") === "s-head,s-next", "填 0 ＝ 全部列出（原本的行為）", rowsNow().join(","));
+	check(foldRowOf("dsh-demo") === undefined, "填 0 的時候沒有折疊那一行");
+
+	// 還原預設，後面的測試照原本前提跑。
+	sandbox.captured.exports.writeSettings({ keepRecent: 5 });
+	created.find((node) => node.props?.["data-chain-row"] === "dsh-demo").props.onClick();
+	await settle(Card);
+}
+
 // ── 2026-10-18：卡片上就地改名（使用者：改名只能再進去下一層，太麻煩）─────────
 {
 	// 先展開一條鏈：才好驗「改完名展開狀態跟著換名字」（否則鏈會突然收起來）。
@@ -1487,6 +1550,16 @@ function containerCount(foot) {
 	const panelRoot = created.find((node) => node.props?.["data-session-chains-panel"] !== undefined);
 	check(panelRoot?.props?.style?.["--sc-font"] === "13px", "面板根節點套用 --sc-font（字級真的變了）", String(panelRoot?.props?.style?.["--sc-font"]));
 	check(created.some((node) => node.props?.["data-sc-setting"] === "accent" && node.props?.type === "color"), "提醒顏色可以用色票改");
+	// 2026-11-16（使用者要求）：每條鏈保留最近幾場，設定裡自己填（0＝全部）。
+	const keepInput = created.find((node) => node.props?.["data-sc-setting"] === "keepRecent");
+	check(keepInput !== undefined && keepInput.props?.type === "number", "設定裡可以填「每條鏈顯示幾場」");
+	keepInput.props.onChange({ target: { value: "3" } });
+	await settle(panel.component);
+	check(readSettings().keepRecent === 3, "填了 3 就寫進設定", String(readSettings().keepRecent));
+	keepInput.props.onChange({ target: { value: "0" } });
+	await settle(panel.component);
+	check(readSettings().keepRecent === 0, "0 是合法值（＝全部列出，不是壞值回預設）", String(readSettings().keepRecent));
+	sandbox.captured.exports.writeSettings({ keepRecent: 5 });
 	check(
 		created.some((node) => node.props?.["data-sc-setting"] === "foldWorkspace" && node.props?.type === "checkbox"),
 		"「工作區可折疊」是勾選項（設定裡決定要不要那顆箭頭）",
